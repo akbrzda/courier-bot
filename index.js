@@ -5,7 +5,7 @@ const { google } = require("googleapis");
 const moment = require("moment-timezone");
 const cron = require("node-cron");
 
-const { ensureWeekSheetAndAsk, upsertSchedule, showSchedule, parseAndAppend } = require("./grafik.js");
+const { ensureWeekSheetAndAsk, upsertSchedule, getScheduleText, parseAndAppend, isScheduleSubmissionAllowed, getWeekBounds } = require("./grafik.js");
 
 // ==================== Инициализация бота ====================
 const bot = new Telegraf(process.env.BOT_TOKEN);
@@ -83,20 +83,44 @@ function parseDate(str) {
 }
 
 // ==================== Главное меню ====================
-function mainMenu() {
-  return Markup.keyboard([
-    ["📅 Табель за сегодня", "📆 Табель за вчера"],
-    ["📊 Табель за прошлую неделю", "📊 Табель за текущую неделю"],
-    ["Отправить график", "Посмотреть график"],
-    ["Изменить график"],
-  ]).resize();
+// ========== INLINE MENU GENERATORS ==========
+
+function getMainMenuInline() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('📅 Табель', 'menu:report')],
+    [Markup.button.callback('📊 График', 'menu:schedule')],
+  ]);
 }
+
+function getReportMenuInline() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('📅 За сегодня', 'report:today')],
+    [Markup.button.callback('📆 За вчера', 'report:yesterday')],
+    [Markup.button.callback('📊 Текущая неделя', 'report:week_current')],
+    [Markup.button.callback('📊 Прошлая неделя', 'report:week_prev')],
+    [Markup.button.callback('◀️ Назад', 'menu:main')],
+  ]);
+}
+
+function getScheduleMenuInline() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('👁 Посмотреть график', 'schedule:view')],
+    [Markup.button.callback('➕ Отправить график', 'schedule:send')],
+    [Markup.button.callback('🛠 Изменить график', 'schedule:edit')],
+    [Markup.button.callback('◀️ Назад', 'menu:main')],
+  ]);
+}
+function getBackInlineMenu(callbackBack) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('◀️ Назад', callbackBack)]
+  ]);
+}
+
 
 // ==================== Админское меню ====================
 function adminMenu() {
   return Markup.keyboard([
     ["👥 Список курьеров", "❌ Удалить курьера"],
-    ["Посмотреть график", "🔙 Главное меню"],
   ]).resize();
 }
 
@@ -256,73 +280,20 @@ bot.use(stage.middleware());
 // ==================== Обработчики команд ====================
 bot.start(async (ctx) => {
   const userId = ctx.from.id.toString();
-  const fullNameTG = `${ctx.from.first_name} ${ctx.from.last_name || ""}`.trim();
 
   if (userId === ADMIN_ID) {
     return await ctx.reply("👋 Добро пожаловать, администратор!", adminMenu());
   }
 
   if (users[userId]?.status === "approved") {
-    return await ctx.reply(`✅ Вы уже зарегистрированы как ${users[userId].name}`, mainMenu());
+    return await ctx.reply(`${users[userId].name}, Вы сейчас находитесь в главном меню бота. Выберите действие:`, getMainMenuInline());
   }
 
   if (users[userId]?.status === "pending") {
-    return await ctx.reply("⏳ Ваша заявка на регистрацию рассматривается администратором.", mainMenu());
+    return await ctx.reply("⏳ Ваша заявка на регистрацию рассматривается администратором.");
   }
 
   return await ctx.scene.enter("registration");
-});
-
-bot.command("menu", async (ctx) => {
-  const userId = ctx.from.id.toString();
-  if (userId === ADMIN_ID) {
-    await ctx.reply("Админское меню:", adminMenu());
-  } else if (users[userId]?.status === "approved") {
-    await ctx.reply("Главное меню:", mainMenu());
-  } else {
-    await ctx.reply("Пройдите регистрацию /start");
-  }
-});
-
-bot.help(async (ctx) => {
-  const userId = ctx.from.id.toString();
-
-  let helpText = "Помощь по боту:\n";
-  helpText += "/start - начать регистрацию\n";
-  helpText += "/menu - показать меню\n";
-
-  if (users[userId]?.status === "approved") {
-    helpText += "\nДоступные команды:\n";
-    helpText += "📅 Табель за сегодня\n";
-    helpText += "📆 Табель за вчера\n";
-    helpText += "📊 Табель за прошлую неделю\n";
-    helpText += "📊 Табель за текущую неделю\n";
-  }
-
-  if (userId === ADMIN_ID) {
-    helpText += "\n\nАдмин-команды:\n";
-    helpText += "👥 Список курьеров\n";
-    helpText += "❌ Удалить курьера";
-  }
-
-  await ctx.reply(helpText, userId === ADMIN_ID ? adminMenu() : mainMenu());
-});
-
-// ==================== Обработчики сообщений ====================
-bot.hears("📅 Табель за сегодня", async (ctx) => {
-  await sendReport(ctx, "today");
-});
-
-bot.hears("📆 Табель за вчера", async (ctx) => {
-  await sendReport(ctx, "yesterday");
-});
-
-bot.hears("📊 Табель за прошлую неделю", async (ctx) => {
-  await sendReport(ctx, "last_week");
-});
-
-bot.hears("📊 Табель за текущую неделю", async (ctx) => {
-  await sendReport(ctx, "current_week");
 });
 
 // Админские команды
@@ -330,7 +301,7 @@ bot.hears("👥 Список курьеров", async (ctx) => {
   const userId = ctx.from.id.toString();
 
   if (userId !== ADMIN_ID) {
-    return await ctx.reply("⛔ Недостаточно прав", mainMenu());
+    return await ctx.reply("⛔ Недостаточно прав", getMainMenuInline());
   }
 
   const approvedUsers = Object.entries(users)
@@ -353,7 +324,7 @@ bot.hears("❌ Удалить курьера", async (ctx) => {
   const userId = ctx.from.id.toString();
 
   if (userId !== ADMIN_ID) {
-    return await ctx.reply("⛔ Недостаточно прав", mainMenu());
+    return await ctx.reply("⛔ Недостаточно прав", getMainMenuInline());
   }
 
   await ctx.scene.enter("deleteCourier");
@@ -361,13 +332,110 @@ bot.hears("❌ Удалить курьера", async (ctx) => {
 
 bot.hears("🔙 Главное меню", async (ctx) => {
   const userId = ctx.from.id.toString();
-  await ctx.reply("Главное меню", userId === ADMIN_ID ? adminMenu() : mainMenu());
+  await ctx.reply("Главное меню", userId === ADMIN_ID ? adminMenu() : getMainMenuInline());
 });
 
 // ==================== Обработчики callback-запросов ====================
 bot.on("callback_query", async (ctx) => {
   const data = ctx.callbackQuery.data;
-  const adminId = ctx.from.id.toString();
+  const userId = ctx.from.id.toString();
+  const { from, to } = getWeekBounds(true);
+  ctx.session = ctx.session || {};
+
+  // ========== Юзерское инлайн-меню ==========
+  if (
+    data.startsWith('menu:') ||
+    data.startsWith('report:') ||
+    data.startsWith('schedule:')
+  ) {
+    // Главное меню
+    if (data === 'menu:main') {
+		const userId = ctx.from.id.toString();
+      await ctx.editMessageText(`${users[userId].name}, Вы сейчас находитесь в главном меню бота.\n\nВыберите действие:`, getMainMenuInline());
+      return;
+    }
+
+    // Подменю Табель
+    if (data === 'menu:report') {
+      await ctx.editMessageText(`Отчет по вашей заработной плате.\n\nВыберите действие:`, getReportMenuInline());
+      return;
+    }
+
+    // Показываем только "Назад" при просмотре отчёта!
+    if (data.startsWith('report:')) {
+      await ctx.editMessageText('⏳ Загружаю табель...', getBackInlineMenu('menu:report'));
+      let period = null;
+      if (data === 'report:today') period = 'today';
+      if (data === 'report:yesterday') period = 'yesterday';
+      if (data === 'report:week_current') period = 'current_week';
+      if (data === 'report:week_prev') period = 'last_week';
+      try {
+        const text = await sendReportText(userId, period);
+        await ctx.editMessageText(text, { parse_mode: "Markdown", ...getBackInlineMenu('menu:report') });
+      } catch (e) {
+        await ctx.editMessageText('❗ ' + e.message, getBackInlineMenu('menu:report'));
+      }
+      return;
+    }
+
+    // Подменю График
+    if (data === 'menu:schedule') {
+      await ctx.editMessageText(`Просмотр и отправка графика.\n\nВыберите действие:`, getScheduleMenuInline());
+      return;
+    }
+
+    // Просмотр графика — только "Назад"
+    if (data === 'schedule:view:current' || data === 'schedule:view:next') {
+      await ctx.editMessageText('⏳ Получаю график...', getBackInlineMenu('menu:schedule'));
+      try {
+        const nextWeek = data.endsWith('next');
+        const grafText = await getScheduleText(SPREADSHEET_ID, userId, nextWeek);
+        await ctx.editMessageText(grafText, { parse_mode: "Markdown", ...getBackInlineMenu('menu:schedule') });
+      } catch (e) {
+        await ctx.editMessageText('❗ ' + e.message, getBackInlineMenu('menu:schedule'));
+      }
+      return;
+    }
+
+    // Посмотреть график (выбор недели)
+    if (data === 'schedule:view') {
+      await ctx.editMessageText('Выберите неделю:', Markup.inlineKeyboard([
+        [Markup.button.callback("Текущая неделя", "schedule:view:current")],
+        [Markup.button.callback("Следующая неделя", "schedule:view:next")],
+        [Markup.button.callback("◀️ Назад", "menu:schedule")]
+      ]));
+      return;
+    }
+
+    // Отправить график/Изменить график — тут тоже только Назад
+    if (data === 'schedule:send') {
+		  if (!isScheduleSubmissionAllowed()) {
+    await ctx.editMessageText(
+      "График можно отправлять только с 22:00 четверга и до 12:00 воскресенья.",
+      getBackInlineMenu('menu:schedule')
+    );
+    return;
+  }
+      const warn = `📅 Пришлите ваш график на период ${from.format("DD.MM")}–${to.format("DD.MM")} в формате:\n\nПн: 10-23\nВт: 10-23\n…`;
+      await ctx.editMessageText(warn, getBackInlineMenu('menu:schedule'));
+      ctx.session.awaitingSchedule = true;
+      ctx.session.scheduleMode = 'send';
+      ctx.session.lastInlineMsgId = ctx.callbackQuery.message.message_id;
+      return;
+    }
+    if (data === 'schedule:edit') {
+      const warn = `📅 Пришлите ваш измененный график на период ${from.format("DD.MM")}–${to.format("DD.MM")} в формате:\n\nПн: 10-23\nВт: 10-23\n…`;
+      await ctx.editMessageText(warn, getBackInlineMenu('menu:schedule'));
+      ctx.session.awaitingSchedule = true;
+      ctx.session.scheduleMode = 'edit';
+      ctx.session.lastInlineMsgId = ctx.callbackQuery.message.message_id;
+      return;
+    }
+  }
+
+  // ==== АДМИНСКИЕ/РЕГИСТРАЦИОННЫЕ ВЕТКИ (оставь как было!) ====
+
+  // Пример: обработка просмотра графика (старое)
   if (data === "SHOW_SCHEDULE_THIS" || data === "SHOW_SCHEDULE_NEXT") {
     await ctx.answerCbQuery();
     try {
@@ -378,7 +446,8 @@ bot.on("callback_query", async (ctx) => {
     await handleShowScheduleInline(ctx, data === "SHOW_SCHEDULE_NEXT");
     return;
   }
-  // Обработка отмены удаления
+
+  // Пример: отмена удаления
   if (data === "cancel_delete") {
     await ctx.answerCbQuery("Отменено");
     await ctx.deleteMessage();
@@ -386,62 +455,82 @@ bot.on("callback_query", async (ctx) => {
   }
 
   // Проверка прав администратора для других действий
-  if (adminId !== ADMIN_ID) {
+  if (userId !== ADMIN_ID) {
     return await ctx.answerCbQuery("⛔ Недостаточно прав");
   }
 
   // Обработка подтверждения/отклонения регистрации
   if (data.startsWith("approve_") || data.startsWith("reject_")) {
-    const userId = data.split("_")[1];
-    const user = users[userId];
+    const idToChange = data.split("_")[1];
+    const user = users[idToChange];
 
     if (!user) {
       return await ctx.answerCbQuery("Пользователь не найден");
     }
 
+try {
+  if (data.startsWith("approve_")) {
+    users[idToChange].status = "approved";
+    saveUsers();
+
+    await ctx.editMessageText(`✅ Курьер ${user.name} подтверждён.`);
+    await ctx.answerCbQuery("Пользователь подтверждён");
+
+    // Отправка уведомления пользователю — оборачиваем отдельно
     try {
-      if (data.startsWith("approve_")) {
-        users[userId].status = "approved";
-        saveUsers();
-
-        await ctx.editMessageText(`✅ Курьер ${user.name} подтверждён.`);
-        await ctx.answerCbQuery("Пользователь подтверждён");
-
-        await bot.telegram.sendMessage(userId, `✅ Ваша заявка одобрена!\nТеперь вам доступно меню.`, mainMenu());
-      }
-
-      if (data.startsWith("reject_")) {
-        delete users[userId];
-        saveUsers();
-
-        await ctx.editMessageText(`❌ Заявка от ${user.name} отклонена.`);
-        await ctx.answerCbQuery("Заявка отклонена");
-        await bot.telegram.sendMessage(userId, `❌ Ваша заявка отклонена.`);
-      }
+      await bot.telegram.sendMessage(
+        idToChange,
+        `Ваша заявка одобрена!\nТеперь вам доступны все возможности нашего бота. Добро пожаловать :)\n\nВыберите действие:`,
+        getMainMenuInline()
+      );
     } catch (err) {
-      await ctx.answerCbQuery("⚠️ Произошла ошибка");
+      console.error(`Не удалось отправить уведомление об одобрении курьеру ${idToChange}:`, err.message);
     }
+  }
+
+  if (data.startsWith("reject_")) {
+    delete users[idToChange];
+    saveUsers();
+
+    await ctx.editMessageText(`❌ Заявка от ${user.name} отклонена.`);
+    await ctx.answerCbQuery("Заявка отклонена");
+
+    // Отправка уведомления об отклонении
+    try {
+      await bot.telegram.sendMessage(
+        idToChange,
+        `❌ Ваша заявка отклонена.`
+      );
+    } catch (err) {
+      console.error(`Не удалось отправить уведомление об отказе курьеру ${idToChange}:`, err.message);
+    }
+  }
+} catch (err) {
+  await ctx.answerCbQuery("⚠️ Произошла ошибка");
+  console.error("Ошибка при обработке подтверждения/отклонения:", err.message);
+}
+
     return;
   }
 
   // Обработка удаления курьера
   if (data.startsWith("delete_")) {
-    const userId = data.split("_")[1];
-    const user = users[userId];
+    const idToDelete = data.split("_")[1];
+    const user = users[idToDelete];
 
     if (!user) {
       await ctx.answerCbQuery("Курьер не найден");
       return;
     }
 
-    delete users[userId];
+    delete users[idToDelete];
     saveUsers();
 
     await ctx.editMessageText(`Курьер ${user.name} удалён.`);
     await ctx.answerCbQuery("Курьер удалён");
 
     try {
-      await bot.telegram.sendMessage(userId, "❌ Ваш аккаунт был удалён администратором.");
+      await bot.telegram.sendMessage(idToDelete, "❌ Ваш аккаунт был удалён администратором.");
     } catch (err) {}
     return;
   }
@@ -449,31 +538,8 @@ bot.on("callback_query", async (ctx) => {
   // Если callback не распознан
   await ctx.answerCbQuery("Неизвестная команда");
 });
+
 // ==================== Интеграция grafik.js ====================
-
-bot.hears("Отправить график", async (ctx) => {
-  const userId = ctx.from.id.toString();
-  if (!users[userId] || users[userId].status !== "approved") {
-    return ctx.reply("❌ Доступ запрещён. Пройдите регистрацию /start", mainMenu());
-  }
-  ctx.session.waitingSchedule = true;
-  try {
-    ctx.session.currentSheet = await ensureWeekSheetAndAsk(SPREADSHEET_ID, ctx.chat.id, ctx.telegram);
-  } catch (e) {
-    console.error(e);
-    await ctx.reply("❗ Ошибка: " + e.message, mainMenu());
-    ctx.session.waitingSchedule = false;
-  }
-});
-
-bot.hears("Посмотреть график", (ctx) => {
-  return ctx.reply(
-    "Выберите неделю:",
-    Markup.inlineKeyboard([
-      [Markup.button.callback("Текущая неделя", "SHOW_SCHEDULE_THIS"), Markup.button.callback("Следующая неделя", "SHOW_SCHEDULE_NEXT")],
-    ])
-  );
-});
 
 async function handleShowScheduleInline(ctx, nextWeek) {
   const userId = ctx.from.id.toString();
@@ -498,246 +564,237 @@ async function handleShowScheduleInline(ctx, nextWeek) {
   }
 }
 
-bot.hears("Изменить график", async (ctx) => {
-  const userId = ctx.from.id.toString();
-  if (!users[userId] || users[userId].status !== "approved") {
-    return ctx.reply("❌ Доступ запрещён. Пройдите регистрацию /start", mainMenu());
-  }
-  ctx.session.waitingScheduleEdit = true; // для дальнейшего различения в on('text')
-  try {
-    ctx.session.currentSheet = await ensureWeekSheetAndAsk(SPREADSHEET_ID, ctx.chat.id, ctx.telegram, false);
-    await ctx.reply("✏️ Пришлите новый график — он полностью заменит предыдущий!", mainMenu());
-  } catch (e) {
-    console.error(e);
-    await ctx.reply("❗ Ошибка: " + e.message, mainMenu());
-    ctx.session.waitingScheduleEdit = false;
-  }
-});
-
 // Обработка текста с расписанием
 bot.on("text", async (ctx) => {
-  // Изменить график
-  if (ctx.session.waitingScheduleEdit) {
-    ctx.session.waitingScheduleEdit = false;
+  ctx.session = ctx.session || {};
+  const userId = ctx.from.id.toString();
+
+  // Новое расписание (добавить)
+  if (ctx.session.awaitingSchedule && ctx.session.scheduleMode === 'send') {
+    ctx.session.awaitingSchedule = false;
     try {
-      await upsertSchedule(SPREADSHEET_ID, ctx.session.currentSheet, ctx.message.text.trim(), ctx.chat.id, ctx.telegram);
-      await ctx.reply("✅ Ваш график обновлён!", mainMenu());
+      ctx.session.currentSheet = await ensureWeekSheetAndAsk(SPREADSHEET_ID, ctx.chat.id, ctx.telegram);
+      await parseAndAppend(SPREADSHEET_ID, ctx.session.currentSheet, ctx.message.text.trim(), userId);
+      await ctx.telegram.editMessageText(ctx.chat.id, ctx.session.lastInlineMsgId, null, "✅ График сохранён!", getScheduleMenuInline());
     } catch (e) {
-      console.error(e);
-      await ctx.reply("❗ Ошибка: " + e.message, mainMenu());
+      await ctx.telegram.editMessageText(ctx.chat.id, ctx.session.lastInlineMsgId, null, '❗ ' + e.message, getScheduleMenuInline());
     }
     return;
   }
-
-  // Отправить график (новый)
-  if (ctx.session.waitingSchedule) {
-    ctx.session.waitingSchedule = false;
-    const text = ctx.message.text.trim();
-    const sheetName = ctx.session.currentSheet;
+  // Редактирование расписания
+  if (ctx.session.awaitingSchedule && ctx.session.scheduleMode === 'edit') {
+    ctx.session.awaitingSchedule = false;
     try {
-      await parseAndAppend(SPREADSHEET_ID, sheetName, text, ctx.from.id.toString());
-      await ctx.reply("✅ График сохранён!", mainMenu());
+      ctx.session.currentSheet = await ensureWeekSheetAndAsk(SPREADSHEET_ID, ctx.chat.id, ctx.telegram, false);
+      await upsertSchedule(SPREADSHEET_ID, ctx.session.currentSheet, ctx.message.text.trim(), userId, ctx.telegram);
+      await ctx.telegram.editMessageText(ctx.chat.id, ctx.session.lastInlineMsgId, null, "✅ График обновлён!", getScheduleMenuInline());
     } catch (e) {
-      console.error(e);
-      await ctx.reply(e.message, mainMenu());
+      await ctx.telegram.editMessageText(ctx.chat.id, ctx.session.lastInlineMsgId, null, '❗ ' + e.message, getScheduleMenuInline());
     }
     return;
   }
 });
 
 // ==================== Функция отправки отчетов ====================
-async function sendReport(ctx, period) {
-  const userId = ctx.from.id.toString();
-
+async function sendReportText(userId, period) {
   if (!users[userId] || users[userId].status !== "approved") {
-    return await ctx.reply("❌ Доступ запрещен. Пройдите регистрацию /start", mainMenu());
+    return "❌ Доступ запрещен. Пройдите регистрацию /start";
+  }
+  const fullName = users[userId].name.trim().toLowerCase();
+  const auth = new google.auth.GoogleAuth({
+    keyFile: "creds.json",
+    scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+  });
+  const client = await auth.getClient();
+  const sheets = google.sheets({ version: "v4", auth: client });
+
+  const sheetNames = [
+    "Сургут 1 (30 лет победы)",
+    "Сургут 2 (Усольцева)",
+    "Сургут 3 (Магистральная)"
+  ];
+
+  let allRows = [];
+  for (const sheetName of sheetNames) {
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.SHEET_ID,
+      range: `${sheetName}!A2:Z`,
+    });
+    if (res.data.values) allRows.push(...res.data.values);
+  }
+  const rows = allRows;
+
+  function parseDate(str) {
+    if (!str || typeof str !== "string" || !str.includes(".")) return null;
+    const [day, month, year] = str.split(".");
+    return new Date(`${month}/${day}/${year}`);
+  }
+  function getPreviousWeekRange() {
+    const now = new Date();
+    const day = now.getDay();
+    const currentMonday = new Date(now);
+    currentMonday.setDate(now.getDate() - ((day + 6) % 7));
+    const lastMonday = new Date(currentMonday);
+    lastMonday.setDate(currentMonday.getDate() - 7);
+    const lastSunday = new Date(lastMonday);
+    lastSunday.setDate(lastMonday.getDate() + 6);
+    lastMonday.setHours(0, 0, 0, 0);
+    lastSunday.setHours(23, 59, 59, 999);
+    return { fromDate: lastMonday, toDate: lastSunday };
+  }
+  function getCurrentWeekRange() {
+    const now = new Date();
+    const day = now.getDay();
+    const diffToMonday = (day + 6) % 7;
+    const monday = new Date(now);
+    monday.setDate(now.getDate() - diffToMonday);
+    monday.setHours(0, 0, 0, 0);
+    const sunday = new Date(monday);
+    sunday.setDate(monday.getDate() + 6);
+    sunday.setHours(23, 59, 59, 999);
+    return { fromDate: monday, toDate: sunday };
   }
 
-  const fullName = users[userId].name.trim().toLowerCase();
+  if (period === "today" || period === "yesterday") {
+    const today = new Date();
+    const target = new Date(today);
+    if (period === "yesterday") target.setDate(today.getDate() - 1);
+    const targetStr = target.toLocaleDateString("ru-RU");
 
-  try {
-    const client = await auth.getClient();
-    const sheets = google.sheets({ version: "v4", auth: client });
-
-    const sheetNames = ["Сургут 1 (30 лет победы)", "Сургут 2 (Усольцева)", "Сургут 3 (Магистральная)"];
-
-    let allRows = [];
-
-    for (const sheetName of sheetNames) {
-      const res = await sheets.spreadsheets.values.get({
-        spreadsheetId: process.env.SHEET_ID,
-        range: `${sheetName}!A2:Z`,
-      });
-
-      if (res.data.values) {
-        allRows.push(...res.data.values);
-      }
+    const match = rows.find((r) => {
+      const rowName = r[2]?.trim().toLowerCase();
+      const rowDateStr = r[1];
+      const rowDate = parseDate(rowDateStr);
+      return rowName === fullName && rowDate?.toLocaleDateString("ru-RU") === targetStr;
+    });
+    if (!match) {
+      return `Данных за ${period === "today" ? "сегодня" : "вчера"} нет.`;
     }
-
-    const rows = allRows;
-    if (period === "today" || period === "yesterday") {
-      const today = new Date();
-      const target = new Date(today);
-      if (period === "yesterday") target.setDate(today.getDate() - 1);
-      const targetStr = target.toLocaleDateString("ru-RU");
-
-      const match = rows.find((r) => {
-        const rowName = r[2]?.trim().toLowerCase();
-        const rowDateStr = r[1];
-        const rowDate = parseDate(rowDateStr);
-        return rowName === fullName && rowDate?.toLocaleDateString("ru-RU") === targetStr;
-      });
-
-      if (!match) {
-        return await ctx.reply(`Данных за ${period === "today" ? "сегодня" : "вчера"} нет.`, mainMenu());
-      }
-
-      const [, date, , , , , , hours, km, orders, , , , times, nps, , , , , , , zaezd1, zaezd2, salary] = match;
-      const totalZaezd = parseFloat(zaezd1 || 0) + parseFloat(zaezd2 || 0);
-      return await ctx.reply(
-        `📅 ${date}\n👤 ${users[userId].name}\n\n` +
-          `Отработано: ${hours}\n` +
-          `Пробег: ${km} км\n` +
-          `Заказы: ${orders}\n` +
-          `Заезды: ${totalZaezd}\n` +
-          `Сумма: ${salary} ₽`,
-        mainMenu()
+    const [, date, , , , , , hours, km, orders, , , , times, nps, , , , , , , zaezd1, zaezd2, salary] = match;
+    const totalZaezd = parseFloat(zaezd1 || 0) + parseFloat(zaezd2 || 0);
+    return (
+      `📅 ${date}\n👤 ${users[userId].name}\n\n` +
+      `Отработано: ${hours}\n` +
+      `Пробег: ${km} км\n` +
+      `Заказы: ${orders}\n` +
+      `Заезды: ${totalZaezd}\n` +
+      `Сумма: ${salary} ₽`
+    );
+  }
+  if (period === "last_week") {
+    const { fromDate, toDate } = getPreviousWeekRange();
+    const filtered = rows.filter((r) => {
+      const rowName = r[2]?.trim().toLowerCase();
+      const rowDateStr = r[1];
+      const rowDate = parseDate(rowDateStr);
+      return rowName === fullName && rowDate && rowDate >= fromDate && rowDate <= toDate;
+    });
+    if (filtered.length === 0) {
+      return (
+        `Нет данных за прошлую неделю ` +
+        `(${fromDate.toLocaleDateString("ru-RU")} - ${toDate.toLocaleDateString("ru-RU")})`
       );
     }
-
-    if (period === "last_week") {
-      const { fromDate, toDate } = getPreviousWeekRange();
-
-      const filtered = rows.filter((r) => {
-        const rowName = r[2]?.trim().toLowerCase();
-        const rowDateStr = r[1];
-        const rowDate = parseDate(rowDateStr);
-        return rowName === fullName && rowDate && rowDate >= fromDate && rowDate <= toDate;
-      });
-
-      if (filtered.length === 0) {
-        return await ctx.reply(
-          `Нет данных за прошлую неделю ` + `(${fromDate.toLocaleDateString("ru-RU")} - ${toDate.toLocaleDateString("ru-RU")})`,
-          mainMenu()
-        );
-      }
-
-      let totalHours = 0,
-        totalKm = 0,
-        totalOrders = 0,
-        totalSalary = 0,
-        totalZaezdy = 0;
-      let times = "",
-        rating = "";
-      let message =
-        `📅 Табель за прошлую неделю ` +
-        `(${fromDate.toLocaleDateString("ru-RU")} - ${toDate.toLocaleDateString("ru-RU")})\n` +
-        `👤 ${users[userId].name}`;
-
-      for (const r of filtered) {
-        const [, date, , , , , , hours, km, orders, , , , time, nps, , , , , , , zaezd1, zaezd2, salary] = r;
-        const totalZaezd = parseFloat(zaezd1 || 0) + parseFloat(zaezd2 || 0);
-        message +=
-          `\n\n📆 ${date}:\n` +
-          `Отработано: ${hours} ч\n` +
-          `Пробег: ${km} км\n` +
-          `Заказы: ${orders}\n` +
-          `Заезды: ${totalZaezd}\n` +
-          `Сумма: ${salary} ₽`;
-
-        totalHours += parseFloat(hours || 0);
-        totalKm += parseFloat(km || 0);
-        totalOrders += parseInt(orders || 0);
-        totalSalary += parseFloat(salary || 0);
-        totalZaezdy += totalZaezd;
-        times = time;
-        rating = nps;
-      }
-
+    let totalHours = 0,
+      totalKm = 0,
+      totalOrders = 0,
+      totalSalary = 0,
+      totalZaezdy = 0;
+    let times = "",
+      rating = "";
+    let message =
+      `📅 Табель за прошлую неделю ` +
+      `(${fromDate.toLocaleDateString("ru-RU")} - ${toDate.toLocaleDateString("ru-RU")})\n` +
+      `👤 ${users[userId].name}`;
+    for (const r of filtered) {
+      const [, date, , , , , , hours, km, orders, , , , time, nps, , , , , , , zaezd1, zaezd2, salary] = r;
+      const totalZaezd = parseFloat(zaezd1 || 0) + parseFloat(zaezd2 || 0);
       message +=
-        `\n\nИТОГО:\n` +
-        `Отработано: ${totalHours} ч\n` +
-        `Пробег: ${totalKm} км\n` +
-        `Заказов: ${totalOrders}\n` +
-        `Заезды: ${totalZaezdy}\n` +
-        `Заработано: ${totalSalary.toFixed(2)} ₽\n` +
-        `Рейтинг: ${rating}\n` +
-        `Среднее время: ${times} мин`;
-
-      return await ctx.reply(message, mainMenu());
+        `\n\n📆 ${date}:\n` +
+        `Отработано: ${hours} ч\n` +
+        `Пробег: ${km} км\n` +
+        `Заказы: ${orders}\n` +
+        `Заезды: ${totalZaezd}\n` +
+        `Сумма: ${salary} ₽`;
+      totalHours += parseFloat(hours || 0);
+      totalKm += parseFloat(km || 0);
+      totalOrders += parseInt(orders || 0);
+      totalSalary += parseFloat(salary || 0);
+      totalZaezdy += totalZaezd;
+      times = time;
+      rating = nps;
     }
-
-    if (period === "current_week") {
-      const { fromDate, toDate } = getCurrentWeekRange();
-
-      const filtered = rows.filter((r) => {
-        const rowName = r[2]?.trim().toLowerCase();
-        const rowDate = parseDate(r[1]);
-        return rowName === fullName && rowDate && rowDate >= fromDate && rowDate <= toDate;
-      });
-
-      if (filtered.length === 0) {
-        return await ctx.reply(
-          `Нет данных за текущую неделю ` + `(${fromDate.toLocaleDateString("ru-RU")} - ${toDate.toLocaleDateString("ru-RU")})`,
-          mainMenu()
-        );
-      }
-
-      // аккумулируем итоги
-      let totalHours = 0,
-        totalKm = 0,
-        totalOrders = 0,
-        totalSalary = 0,
-        totalZaezdy = 0;
-      let lastTime = "",
-        lastRating = "";
-      let message =
-        `📅 Табель за текущую неделю ` +
-        `(${fromDate.toLocaleDateString("ru-RU")} - ${toDate.toLocaleDateString("ru-RU")})\n` +
-        `👤 ${users[userId].name}`;
-
-      for (const r of filtered) {
-        const [, date, , , , , , hours, km, orders, , , , time, nps, , , , , , , zaezd1, zaezd2, salary] = r;
-        const zaezdy = parseFloat(zaezd1 || 0) + parseFloat(zaezd2 || 0);
-
-        message +=
-          `\n\n📆 ${date}:\n` +
-          `Отработано: ${hours} ч\n` +
-          `Пробег: ${km} км\n` +
-          `Заказы: ${orders}\n` +
-          `Заезды: ${zaezdy}\n` +
-          `Сумма: ${salary} ₽`;
-
-        totalHours += parseFloat(hours || 0);
-        totalKm += parseFloat(km || 0);
-        totalOrders += parseInt(orders || 0, 10);
-        totalSalary += parseFloat(salary || 0);
-        totalZaezdy += zaezdy;
-        lastTime = time;
-        lastRating = nps;
-      }
-
-      message +=
-        `\n\nИТОГО:\n` +
-        `Отработано: ${totalHours} ч\n` +
-        `Пробег: ${totalKm} км\n` +
-        `Заказов: ${totalOrders}\n` +
-        `Заезды: ${totalZaezdy}\n` +
-        `Заработано: ${totalSalary.toFixed(2)} ₽\n` +
-        `Рейтинг: ${lastRating}\n` +
-        `Среднее время: ${lastTime} мин`;
-
-      return await ctx.reply(message, mainMenu());
-    }
-  } catch (err) {
-    return await ctx.reply("⚠️ Произошла ошибка при получении данных. Попробуйте позже.", mainMenu());
+    message +=
+      `\n\nИТОГО:\n` +
+      `Отработано: ${totalHours} ч\n` +
+      `Пробег: ${totalKm} км\n` +
+      `Заказов: ${totalOrders}\n` +
+      `Заезды: ${totalZaezdy}\n` +
+      `Заработано: ${totalSalary.toFixed(2)} ₽\n` +
+      `Рейтинг: ${rating}\n` +
+      `Среднее время: ${times} мин`;
+    return message;
   }
+  if (period === "current_week") {
+    const { fromDate, toDate } = getCurrentWeekRange();
+    const filtered = rows.filter((r) => {
+      const rowName = r[2]?.trim().toLowerCase();
+      const rowDate = parseDate(r[1]);
+      return rowName === fullName && rowDate && rowDate >= fromDate && rowDate <= toDate;
+    });
+    if (filtered.length === 0) {
+      return (
+        `Нет данных за текущую неделю ` +
+        `(${fromDate.toLocaleDateString("ru-RU")} - ${toDate.toLocaleDateString("ru-RU")})`
+      );
+    }
+    let totalHours = 0,
+      totalKm = 0,
+      totalOrders = 0,
+      totalSalary = 0,
+      totalZaezdy = 0;
+    let lastTime = "",
+      lastRating = "";
+    let message =
+      `📅 Табель за текущую неделю ` +
+      `(${fromDate.toLocaleDateString("ru-RU")} - ${toDate.toLocaleDateString("ru-RU")})\n` +
+      `👤 ${users[userId].name}`;
+    for (const r of filtered) {
+      const [, date, , , , , , hours, km, orders, , , , time, nps, , , , , , , zaezd1, zaezd2, salary] = r;
+      const zaezdy = parseFloat(zaezd1 || 0) + parseFloat(zaezd2 || 0);
+      message +=
+        `\n\n📆 ${date}:\n` +
+        `Отработано: ${hours} ч\n` +
+        `Пробег: ${km} км\n` +
+        `Заказы: ${orders}\n` +
+        `Заезды: ${zaezdy}\n` +
+        `Сумма: ${salary} ₽`;
+      totalHours += parseFloat(hours || 0);
+      totalKm += parseFloat(km || 0);
+      totalOrders += parseInt(orders || 0, 10);
+      totalSalary += parseFloat(salary || 0);
+      totalZaezdy += zaezdy;
+      lastTime = time;
+      lastRating = nps;
+    }
+    message +=
+      `\n\nИТОГО:\n` +
+      `Отработано: ${totalHours} ч\n` +
+      `Пробег: ${totalKm} км\n` +
+      `Заказов: ${totalOrders}\n` +
+      `Заезды: ${totalZaezdy}\n` +
+      `Заработано: ${totalSalary.toFixed(2)} ₽\n` +
+      `Рейтинг: ${lastRating}\n` +
+      `Среднее время: ${lastTime} мин`;
+    return message;
+  }
+  return "Нет данных.";
 }
 
 // ==================== Обработка ошибок ====================
 bot.catch(async (err, ctx) => {
   const userId = ctx.from?.id || "unknown";
-  await ctx.reply("⚠️ Произошла ошибка. Попробуйте позже.", mainMenu());
+  await ctx.reply("⚠️ Произошла ошибка. Попробуйте позже.", getMainMenuInline());
 });
 
 // ==================== Запуск бота ====================
