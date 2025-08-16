@@ -1,12 +1,14 @@
 const { google } = require("googleapis");
 const moment = require("moment-timezone");
 const winston = require("winston");
-const fs = require("fs");
+const { pool } = require("./db");
 
 const logger = winston.createLogger({ level: "info", transports: [new winston.transports.Console()] });
 
-// База курьеров: ключ — chatId, значение — { name, status }
-const couriers = fs.existsSync("./users.json") ? require("./users.json") : {};
+async function getUserByIdDb(userId) {
+  const [rows] = await pool.query("SELECT id, name, status FROM users WHERE id=? LIMIT 1", [userId]);
+  return rows[0] || null;
+}
 
 // Инициализация Google Sheets API
 const auth = new google.auth.GoogleAuth({
@@ -112,12 +114,12 @@ async function createWeekSheet(spreadsheetId, { from, to }) {
 }
 
 // Подготовка листа для графика
-async function ensureWeekSheetAndAsk(spreadsheetId, chatId, telegram, withPrompt = true) {
+async function ensureWeekSheetAndAsk(spreadsheetId, chatId, telegram, withPrompt = true, nextWeek = true) {
  /* if (!isScheduleSubmissionAllowed()) {
     await telegram.sendMessage(chatId, "График можно отправлять только с 22:00 четверга и до 12:00 воскресенья.");
     return;
   }*/
-  const { from, to } = getWeekBounds(true);
+  const { from, to } = getWeekBounds(nextWeek);
   const sheetName = `${from.format("DD.MM")}-${to.format("DD.MM")}`;
   const prev = getWeekBounds(false);
   const prevTitle = `${prev.from.format("DD.MM")}-${prev.to.format("DD.MM")}`;
@@ -150,7 +152,7 @@ function parseSchedule(text) {
 
 // Добавление расписания
 async function parseAndAppend(spreadsheetId, sheetName, text, chatId) {
-  const courier = couriers[String(chatId)];
+  const courier = await getUserByIdDb(String(chatId));
   if (!courier || courier.status !== "approved") {
     throw new Error("У вас нет доступа к добавлению графика.");
   }
@@ -176,7 +178,7 @@ async function parseAndAppend(spreadsheetId, sheetName, text, chatId) {
 
 // Обновление расписания (замена)
 async function upsertSchedule(spreadsheetId, sheetName, text, chatId, telegram) {
-  const courier = couriers[String(chatId)];
+  const courier = await getUserByIdDb(String(chatId));
   if (!courier || courier.status !== "approved") {
     await telegram.sendMessage(chatId, "У вас нет доступа к изменению графика.");
     return;
@@ -226,6 +228,56 @@ async function upsertSchedule(spreadsheetId, sheetName, text, chatId, telegram) 
   });
 }
 
+// Обновление расписания по ФИО (для админа)
+async function upsertScheduleForFio(spreadsheetId, sheetName, text, fio, telegram, chatIdForErrors) {
+  if (!fio || !fio.trim()) {
+    await telegram.sendMessage(chatIdForErrors, "Не указано ФИО для изменения графика.");
+    return;
+  }
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `'${sheetName}'!B4:B27`,
+  });
+  const rows = res.data.values || [];
+
+  let rowIdx = null;
+  let names = [];
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i] && rows[i][0]) names.push(rows[i][0]);
+    if (rows[i] && rows[i][0] === fio) rowIdx = 4 + i;
+  }
+
+  let pp = null;
+  if (rowIdx !== null) {
+    const ppRes = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `'${sheetName}'!A${rowIdx}:A${rowIdx}`,
+    });
+    pp = (ppRes.data.values && ppRes.data.values[0] && ppRes.data.values[0][0]) || names.length;
+  } else {
+    for (let i = 0; i < 24; i++) {
+      if (!rows[i] || !rows[i][0]) {
+        rowIdx = 4 + i;
+        break;
+      }
+    }
+    if (rowIdx === null) {
+      await telegram.sendMessage(chatIdForErrors, "Нет свободных строк для добавления графика!");
+      return;
+    }
+    pp = names.length + 1;
+  }
+
+  const hours = parseSchedule(text);
+  const row = [pp, fio, ...hours];
+  await sheets.spreadsheets.values.update({
+    spreadsheetId,
+    range: `'${sheetName}'!A${rowIdx}:I${rowIdx}`,
+    valueInputOption: "USER_ENTERED",
+    resource: { values: [row] },
+  });
+}
+
 // ====================== НОВОЕ =======================
 // Получить график для юзера (строкой, для editMessageText)
 async function getScheduleText(spreadsheetId, userId, nextWeek = false) {
@@ -234,7 +286,8 @@ async function getScheduleText(spreadsheetId, userId, nextWeek = false) {
   const res = await sheets.spreadsheets.values.get({ spreadsheetId, range: `'${sheetName}'!A4:I27` });
   const rows = res.data.values || [];
   let text = `📋 График на период *${from.format("DD.MM")}–${to.format("DD.MM")}*:\n\n`;
-  const fio = couriers[String(userId)]?.name;
+  const user = await getUserByIdDb(String(userId));
+  const fio = user?.name;
   if (!fio) {
     return "❌ Вы не зарегистрированы как курьер. Пройдите регистрацию /start";
   }
@@ -269,6 +322,7 @@ module.exports = {
   ensureWeekSheetAndAsk,
   parseAndAppend,
   upsertSchedule,
+  upsertScheduleForFio,
   getScheduleText,
   getAdminScheduleText,
   isScheduleSubmissionAllowed,
