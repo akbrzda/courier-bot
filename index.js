@@ -9,12 +9,25 @@ const {
   upsertScheduleForFio,
   getScheduleText,
   getAdminScheduleText,
+  getBranchScheduleText,
   parseAndAppend,
   isScheduleSubmissionAllowed,
   getWeekBounds,
 } = require("./grafik.js");
 const { initSchema } = require("./db");
-const { getUserById, upsertUserBasic, setUserStatus, deleteUser, listApprovedUsers, listAllUsers, updateUserName } = require("./services.users");
+const {
+  getUserById,
+  upsertUserBasic,
+  setUserStatus,
+  deleteUser,
+  listApprovedUsers,
+  listAllUsers,
+  updateUserName,
+  updateUserBranch,
+  listApprovedUsersWithoutBranch,
+  updateUserRole,
+  listUsersByRoleAndBranch,
+} = require("./services.users");
 const { logAction, logTabReport, logScheduleAction, logAuthAction, logError, logBotStart, logMenuNavigation, logMessageSent } = require("./logger");
 const {
   getAllLinks,
@@ -27,10 +40,121 @@ const {
   deleteTrainingMaterial,
 } = require("./services.content");
 const bot = new Telegraf(process.env.BOT_TOKEN);
+const BRANCHES = [
+  { id: "surgut_1", label: "Сургут 1 (30 лет победы)" },
+  { id: "surgut_2", label: "Сургут 2 (Усольцева)" },
+  { id: "surgut_3", label: "Сургут 3 (Магистральная)" },
+];
 const ADMIN_IDS = (process.env.ADMIN_IDS || process.env.ADMIN_ID || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
+const pendingApprovalNotifications = new Map();
+
+const ROLES = Object.freeze({
+  COURIER: "courier",
+  SENIOR: "senior",
+  LOGIST: "logist",
+  ADMIN: "admin",
+});
+
+const BRANCH_MANAGER_ROLES = new Set([ROLES.SENIOR, ROLES.LOGIST, ROLES.ADMIN]);
+const MANAGER_ROLES = new Set([ROLES.SENIOR, ROLES.LOGIST, ROLES.ADMIN]);
+
+function getUserRole(user) {
+  return user?.role || ROLES.COURIER;
+}
+
+async function ensureRoleState(ctx) {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+  ctx.state = ctx.state || {};
+  if (!ctx.state.currentUser) {
+    ctx.state.currentUser = await getUserById(String(userId));
+  }
+  let user = ctx.state.currentUser;
+  ctx.state.isAdmin = computeAdminFlag(userId, user);
+  if (ctx.state.isAdmin && getUserRole(user) !== ROLES.ADMIN) {
+    user = { ...(user || {}), role: ROLES.ADMIN };
+    ctx.state.currentUser = user;
+  }
+  ctx.state.isManager = ctx.state.isAdmin || hasManagerRights(user);
+  ctx.state.isBranchManager = ctx.state.isAdmin || hasBranchManagerRights(user);
+}
+
+function computeAdminFlag(userId, user) {
+  if (!userId) return false;
+  if (ADMIN_IDS.includes(String(userId))) return true;
+  return getUserRole(user) === ROLES.ADMIN;
+}
+
+function hasManagerRights(user) {
+  return MANAGER_ROLES.has(getUserRole(user));
+}
+
+function hasBranchManagerRights(user) {
+  return BRANCH_MANAGER_ROLES.has(getUserRole(user));
+}
+
+function canAccessReports(user) {
+  const role = getUserRole(user);
+  return role === ROLES.COURIER || role === ROLES.ADMIN || role === ROLES.SENIOR;
+}
+
+const ROLE_OPTIONS = [
+  { id: ROLES.COURIER, label: "Курьер" },
+  { id: ROLES.SENIOR, label: "Старший курьер" },
+  { id: ROLES.LOGIST, label: "Логист" },
+];
+
+function getRoleLabel(role) {
+  switch (role) {
+    case ROLES.SENIOR:
+      return "Старший курьер";
+    case ROLES.LOGIST:
+      return "Логист";
+    case ROLES.ADMIN:
+      return "Админ";
+    default:
+      return "Курьер";
+  }
+}
+
+function getBranchLabel(branchId) {
+  const branch = BRANCHES.find((b) => b.id === branchId);
+  return branch ? branch.label : "Филиал не выбран";
+}
+
+function buildBranchKeyboard(prefix) {
+  return Markup.inlineKeyboard(BRANCHES.map((branch) => [Markup.button.callback(branch.label, `${prefix}_${branch.id}`)]));
+}
+
+async function notifyUsersWithoutBranch() {
+  try {
+    const users = await listApprovedUsersWithoutBranch();
+    if (!users.length) {
+      console.log("[Branch] Все одобренные курьеры уже выбрали филиал");
+      return;
+    }
+
+    console.log(`[Branch] Отправляю запрос на выбор филиала ${users.length} пользователям`);
+    for (const user of users) {
+      try {
+        await bot.telegram.sendMessage(String(user.id), "Чтобы продолжить работу с ботом, выберите филиал:", buildBranchKeyboard("branch:select"));
+        await logAction(bot, "Напоминание о выборе филиала", user.id, {
+          name: user.name,
+          username: user.username,
+        });
+      } catch (err) {
+        await logError(bot, err, user.id, { name: user.name, username: user.username }, "Рассылка выбора филиала");
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  } catch (err) {
+    console.error("Не удалось уведомить курьеров без филиала:", err.message);
+  }
+}
 const SPREADSHEET_ID = process.env.GRAFIK;
 
 function getPreviousWeekRange() {
@@ -47,7 +171,7 @@ function getPreviousWeekRange() {
   return { fromDate: lastMonday, toDate: lastSunday };
 }
 
-/*cron.schedule(
+cron.schedule(
   "0 12 * * 5",
   async () => {
     const now = moment().tz("Asia/Yekaterinburg");
@@ -117,7 +241,7 @@ function getPreviousWeekRange() {
     }
   },
   { timezone: "Asia/Yekaterinburg" }
-);*/
+);
 
 function parseDate(str) {
   if (!str || typeof str !== "string" || !str.includes(".")) return null;
@@ -130,19 +254,22 @@ function escapeHtml(value) {
   return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function getMainMenuInline() {
-  return Markup.inlineKeyboard([
-    [Markup.button.callback("📅 Табель", "menu:report")],
-    [Markup.button.callback("📊 График", "menu:schedule")],
-    [Markup.button.callback("🔗 Полезные ссылки", "menu:links")],
-    [Markup.button.callback("📚 Обучение", "menu:training")],
-    [Markup.button.callback("✉️ Написать администратору", "support:start")],
-  ]);
+function getMainMenuInline(user = null) {
+  const buttons = [];
+  if (canAccessReports(user)) {
+    buttons.push([Markup.button.callback("📅 Табель", "menu:report")]);
+  }
+  buttons.push([Markup.button.callback("📊 График", "menu:schedule")]);
+  buttons.push([Markup.button.callback("🔗 Полезные ссылки", "menu:links")]);
+  buttons.push([Markup.button.callback("📚 Обучение", "menu:training")]);
+  buttons.push([Markup.button.callback("✉️ Написать администратору", "support:start")]);
+  return Markup.inlineKeyboard(buttons);
 }
 
-function isAdminId(id) {
+function isAdminId(id, user = null) {
   if (!id) return false;
-  return ADMIN_IDS.includes(String(id));
+  if (ADMIN_IDS.includes(String(id))) return true;
+  return getUserRole(user) === ROLES.ADMIN;
 }
 
 function getReportMenuInline() {
@@ -158,12 +285,23 @@ function getReportMenuInline() {
   ]);
 }
 
-function getScheduleMenuInline() {
-  return Markup.inlineKeyboard([
-    [Markup.button.callback("👁 Посмотреть график", "schedule:view")],
-    //[Markup.button.callback("➕ Отправить график", "schedule:send")],
-    [Markup.button.callback("◀️ Назад", "menu:main")],
-  ]);
+function getScheduleMenuInline(user = null) {
+  const role = getUserRole(user);
+  const buttons = [];
+
+  if (role !== ROLES.LOGIST) {
+    buttons.push([Markup.button.callback("👁 Посмотреть график", "schedule:view")]),
+      buttons.push([Markup.button.callback("➕ Отправить график", "schedule:send")]),
+      buttons.push([Markup.button.callback("🛠 Изменить график", "schedule:edit")]);
+  }
+  if (hasBranchManagerRights(user) && (getUserRole(user) !== ROLES.ADMIN || user?.branch)) {
+    buttons.push([Markup.button.callback("📊 График филиала", "schedule:branch")]);
+  }
+  if (!buttons.length) {
+    buttons.push([Markup.button.callback("📊 График", "schedule:view")]);
+  }
+  buttons.push([Markup.button.callback("◀️ Назад", "menu:main")]);
+  return Markup.inlineKeyboard(buttons);
 }
 function getBackInlineMenu(callbackBack) {
   return Markup.inlineKeyboard([[Markup.button.callback("◀️ Назад", callbackBack)]]);
@@ -175,6 +313,7 @@ function adminMenu() {
     ["📋 График: текущая неделя", "📋 График: следующая неделя"],
     ["✏️ Изменить ФИО курьера", "📢 Рассылка"],
     ["🔗 Управление ссылками", "📚 Управление обучением"],
+    ["🎯 Назначить роль"],
   ]).resize();
 }
 
@@ -232,9 +371,168 @@ const deleteLinkScene = new Scenes.BaseScene("deleteLink");
 // Сцены для управления обучением
 const addTrainingScene = new Scenes.BaseScene("addTraining");
 const deleteTrainingScene = new Scenes.BaseScene("deleteTraining");
+const assignRoleScene = new Scenes.BaseScene("assignRole");
+
+assignRoleScene.enter(async (ctx) => {
+  await ensureRoleState(ctx);
+  const userId = ctx.from.id.toString();
+  const actingUser = ctx.state?.currentUser || (await getUserById(userId));
+  if (!isAdminId(userId, actingUser)) {
+    await ctx.reply("⛔ Недостаточно прав");
+    return ctx.scene.leave();
+  }
+
+  try {
+    const approvedUsers = await listApprovedUsers();
+    if (approvedUsers.length === 0) {
+      await ctx.reply("Нет пользователей для назначения ролей.", adminMenu());
+      return ctx.scene.leave();
+    }
+    ctx.session = ctx.session || {};
+    ctx.session.assignRoleTarget = null;
+
+    const keyboard = approvedUsers.map((u) => {
+      const roleLabel = getRoleLabel(u.role);
+      const branchLabel = getBranchLabel(u.branch);
+      return [Markup.button.callback(`${u.name} • ${roleLabel}`, `assignRole_select_${u.id}`)];
+    });
+    keyboard.push([Markup.button.callback("❌ Отмена", "assignRole:cancel")]);
+    await ctx.reply("Выберите пользователя для изменения роли:", Markup.inlineKeyboard(keyboard));
+  } catch (error) {
+    await ctx.reply("❗ Ошибка при загрузке пользователей: " + error.message, adminMenu());
+    return ctx.scene.leave();
+  }
+});
+
+assignRoleScene.action("assignRole:cancel", async (ctx) => {
+  await ctx.answerCbQuery("Отменено");
+  try {
+    await ctx.deleteMessage();
+  } catch (_) {}
+  return ctx.scene.leave();
+});
+
+assignRoleScene.action(/^assignRole_select_(.+)$/, async (ctx) => {
+  await ensureRoleState(ctx);
+  const targetId = ctx.match[1];
+  const targetUser = await getUserById(targetId);
+  if (!targetUser) {
+    await ctx.answerCbQuery("Пользователь не найден");
+    return;
+  }
+  ctx.session = ctx.session || {};
+  ctx.session.assignRoleTarget = targetId;
+
+  const buttons = ROLE_OPTIONS.map((opt) => {
+    const isCurrent = opt.id === getUserRole(targetUser);
+    return [Markup.button.callback(`${opt.label}${isCurrent ? " ✅" : ""}`, `assignRole_set_${opt.id}`)];
+  });
+  buttons.push([Markup.button.callback("◀️ Назад", "assignRole:back")]);
+
+  await ctx.answerCbQuery();
+  try {
+    await ctx.editMessageText(
+      `Выбран: ${targetUser.name}\nТекущая роль: ${getRoleLabel(targetUser.role)}\nФилиал: ${getBranchLabel(targetUser.branch)}`,
+      Markup.inlineKeyboard(buttons)
+    );
+  } catch (err) {
+    await ctx.reply(
+      `Выбран: ${targetUser.name}\nТекущая роль: ${getRoleLabel(targetUser.role)}\nФилиал: ${getBranchLabel(targetUser.branch)}`,
+      Markup.inlineKeyboard(buttons)
+    );
+  }
+});
+
+assignRoleScene.action("assignRole:back", async (ctx) => {
+  await ctx.answerCbQuery();
+  try {
+    await ctx.deleteMessage();
+  } catch (_) {}
+  return ctx.scene.reenter();
+});
+
+assignRoleScene.action(/^assignRole_set_(.+)$/, async (ctx) => {
+  await ensureRoleState(ctx);
+  const newRole = ctx.match[1];
+  const targetId = ctx.session?.assignRoleTarget;
+  if (!targetId) {
+    await ctx.answerCbQuery("Не выбран пользователь");
+    return;
+  }
+
+  const actorId = ctx.from.id.toString();
+  const actingUser = ctx.state?.currentUser || (await getUserById(actorId));
+  if (!isAdminId(actorId, actingUser)) {
+    await ctx.answerCbQuery("Нет прав");
+    return;
+  }
+
+  const normalizedRole = ROLE_OPTIONS.find((opt) => opt.id === newRole)?.id;
+  if (!normalizedRole) {
+    await ctx.answerCbQuery("Неизвестная роль");
+    return;
+  }
+
+  const targetUser = await getUserById(targetId);
+  if (!targetUser) {
+    await ctx.answerCbQuery("Пользователь не найден");
+    return;
+  }
+
+  if (getUserRole(targetUser) === normalizedRole) {
+    await ctx.answerCbQuery("Уже назначено");
+    return;
+  }
+
+  if (BRANCH_MANAGER_ROLES.has(normalizedRole) && !targetUser.branch) {
+    await ctx.answerCbQuery();
+    await ctx.reply("Сначала назначьте филиал пользователю, затем роль руководителя.", adminMenu());
+    return ctx.scene.leave();
+  }
+
+  try {
+    await updateUserRole(targetId, normalizedRole);
+    await ctx.answerCbQuery("Роль обновлена");
+    await ctx.reply(`Роль пользователя ${targetUser.name} изменена на: ${getRoleLabel(normalizedRole)}.`, adminMenu());
+
+    await logAction(
+      bot,
+      "Назначение роли",
+      actorId,
+      {
+        name:
+          actingUser?.name ||
+          (ctx.from.first_name && ctx.from.last_name
+            ? `${ctx.from.first_name} ${ctx.from.last_name}`
+            : ctx.from.first_name || ctx.from.username || "Неизвестно"),
+        username: ctx.from.username,
+        first_name: ctx.from.first_name,
+        last_name: ctx.from.last_name,
+      },
+      {
+        targetId,
+        targetName: targetUser.name,
+        newRole: normalizedRole,
+      }
+    );
+
+    try {
+      await bot.telegram.sendMessage(String(targetId), `Ваша роль обновлена: ${getRoleLabel(normalizedRole)}.`);
+    } catch (notifyErr) {
+      console.warn("Не удалось уведомить пользователя о смене роли:", notifyErr.message);
+    }
+  } catch (error) {
+    await ctx.answerCbQuery("Ошибка");
+    await ctx.reply("❗ Ошибка при изменении роли: " + error.message, adminMenu());
+  }
+
+  return ctx.scene.leave();
+});
 
 registrationScene.enter(async (ctx) => {
   const userId = ctx.from.id.toString();
+  ctx.session = ctx.session || {};
+  ctx.session.registration = { stage: "name" };
   await ctx.reply(
     "👋 Привет! Введите своё Имя и Фамилия для регистрации. Например, Иванов Иван. Обязательно, без отчества!",
     Markup.removeKeyboard()
@@ -243,6 +541,8 @@ registrationScene.enter(async (ctx) => {
 
 registrationScene.on("text", async (ctx) => {
   const userId = ctx.from.id.toString();
+  ctx.session = ctx.session || {};
+  const registrationState = ctx.session.registration || { stage: "name" };
   const name = ctx.message.text.trim();
   const userInfo = {
     name:
@@ -254,21 +554,67 @@ registrationScene.on("text", async (ctx) => {
     last_name: ctx.from.last_name,
   };
 
+  if (registrationState.stage !== "name") {
+    return await ctx.reply("Пожалуйста, выберите филиал, используя кнопки ниже.");
+  }
+
   if (!name || name.length < 3) {
     await logAction(bot, "Попытка регистрации с некорректным ФИО", userId, userInfo, { enteredName: name });
     return await ctx.reply("❗ Пожалуйста, введите корректное ФИО (минимум 3 символа)");
   }
 
   try {
-    await upsertUserBasic(userId, {
+    ctx.session.registration = {
+      stage: "branch",
       name,
+    };
+
+    await ctx.reply("Теперь выберите филиал, к которому вы относитесь:", buildBranchKeyboard("reg:branch"));
+  } catch (err) {
+    await logError(bot, err, userId, userInfo, "Обработка заявки на регистрацию");
+    return await ctx.reply("⚠️ Произошла ошибка при отправке заявки. Попробуйте позже.");
+  }
+});
+
+registrationScene.action(/^reg:branch_(.+)$/, async (ctx) => {
+  const branchId = ctx.match[1];
+  const branch = BRANCHES.find((b) => b.id === branchId);
+  await ctx.answerCbQuery();
+  if (!branch) {
+    return ctx.reply("Выбрано неизвестное значение. Попробуйте снова.");
+  }
+
+  ctx.session = ctx.session || {};
+  const registrationState = ctx.session.registration;
+  if (!registrationState || registrationState.stage !== "branch" || !registrationState.name) {
+    return ctx.reply("Пожалуйста, начните регистрацию заново командой /start.");
+  }
+
+  const userId = ctx.from.id.toString();
+  const userInfo = {
+    name:
+      ctx.from.first_name && ctx.from.last_name
+        ? `${ctx.from.first_name} ${ctx.from.last_name}`
+        : ctx.from.first_name || ctx.from.username || "Неизвестно",
+    username: ctx.from.username,
+    first_name: ctx.from.first_name,
+    last_name: ctx.from.last_name,
+  };
+
+  try {
+    await upsertUserBasic(userId, {
+      name: registrationState.name,
       status: "pending",
       username: ctx.from.username ? `@${ctx.from.username}` : null,
       first_name: ctx.from.first_name || null,
       last_name: ctx.from.last_name || null,
+      branch: branch.id,
     });
 
-    await logAuthAction(bot, userId, userInfo, "Подача заявки на регистрацию", { enteredName: name });
+    await logAuthAction(bot, userId, userInfo, "Подача заявки на регистрацию", {
+      enteredName: registrationState.name,
+      branch: branch.id,
+    });
 
     const telegramUserInfo = ctx.from;
     const username = telegramUserInfo.username ? `@${telegramUserInfo.username}` : "не указан";
@@ -276,28 +622,68 @@ registrationScene.on("text", async (ctx) => {
 
     for (const admin of ADMIN_IDS) {
       try {
-        await bot.telegram.sendMessage(
+        const sent = await bot.telegram.sendMessage(
           admin,
           `📥 Новая заявка на регистрацию:\n` +
-            `👤 Введённое ФИО: ${name}\n` +
+            `👤 Введённое ФИО: ${registrationState.name}\n` +
             `🔹 Telegram: ${fullTelegramName} (${username})\n` +
+            `🏢 Филиал: ${branch.label}\n` +
             `🆔 Telegram ID: ${userId}`,
           Markup.inlineKeyboard([
             Markup.button.callback(`✅ Подтвердить`, `approve_${userId}`),
             Markup.button.callback(`❌ Отклонить`, `reject_${userId}`),
           ])
         );
+        if (sent?.message_id) {
+          const current = pendingApprovalNotifications.get(userId) || [];
+          current.push({ chatId: admin, messageId: sent.message_id });
+          pendingApprovalNotifications.set(userId, current);
+        }
       } catch (e) {
         console.warn("Не удалось отправить уведомление администратору", admin, e.message);
         await logError(bot, e, userId, userInfo, "Отправка уведомления администратору");
       }
     }
 
+    try {
+      const seniorManagers = await listUsersByRoleAndBranch(ROLES.SENIOR, branch.id);
+      const logistManagers = await listUsersByRoleAndBranch(ROLES.LOGIST, branch.id);
+      const branchManagers = [...seniorManagers, ...logistManagers];
+      const notified = new Set();
+      for (const manager of branchManagers) {
+        if (!manager?.id || notified.has(manager.id)) continue;
+        notified.add(manager.id);
+        try {
+          const sent = await bot.telegram.sendMessage(
+            String(manager.id),
+            `📥 Новая заявка в вашем филиале (${branch.label}):\n` +
+              `👤 ${registrationState.name}\n` +
+              `🔹 Telegram: ${fullTelegramName} (${username})\n` +
+              `🆔 Telegram ID: ${userId}`,
+            Markup.inlineKeyboard([
+              Markup.button.callback(`✅ Подтвердить`, `approve_${userId}`),
+              Markup.button.callback(`❌ Отклонить`, `reject_${userId}`),
+            ])
+          );
+          if (sent?.message_id) {
+            const current = pendingApprovalNotifications.get(userId) || [];
+            current.push({ chatId: manager.id, messageId: sent.message_id });
+            pendingApprovalNotifications.set(userId, current);
+          }
+        } catch (mgrErr) {
+          await logError(bot, mgrErr, manager.id, manager, "Уведомление руководителю о заявке");
+        }
+      }
+    } catch (mgrListErr) {
+      await logError(bot, mgrListErr, "system", {}, "Получение списка руководителей филиала");
+    }
+
     await ctx.reply("⏳ Заявка отправлена! Ожидайте подтверждения администратора.");
+    ctx.session.registration = null;
     await ctx.scene.leave();
   } catch (err) {
     await logError(bot, err, userId, userInfo, "Обработка заявки на регистрацию");
-    return await ctx.reply("⚠️ Произошла ошибка при отправке заявки. Попробуйте позже.");
+    await ctx.reply("⚠️ Произошла ошибка при отправке заявки. Попробуйте позже.");
   }
 });
 
@@ -305,10 +691,17 @@ registrationScene.on("message", async (ctx) => {
   await ctx.reply("Пожалуйста, введите только текст");
 });
 
+registrationScene.leave((ctx) => {
+  if (ctx.session) {
+    delete ctx.session.registration;
+  }
+});
+
 const deleteCourierScene = new Scenes.BaseScene("deleteCourier");
 const broadcastScene = new Scenes.BaseScene("broadcast");
 broadcastScene.enter(async (ctx) => {
-  if (!isAdminId(ctx.from.id)) {
+  await ensureRoleState(ctx);
+  if (!ctx.state?.isAdmin) {
     await ctx.reply("⛔ Недостаточно прав");
     return ctx.scene.leave();
   }
@@ -331,6 +724,7 @@ broadcastScene.action("broadcast:cancel", async (ctx) => {
 });
 
 broadcastScene.action("broadcast:skip_photo", async (ctx) => {
+  await ensureRoleState(ctx);
   await ctx.answerCbQuery();
   ctx.session.broadcastPhoto = null;
   ctx.session.broadcastStep = "link_url";
@@ -345,6 +739,7 @@ broadcastScene.action("broadcast:skip_photo", async (ctx) => {
 });
 
 broadcastScene.action("broadcast:skip_link", async (ctx) => {
+  await ensureRoleState(ctx);
   await ctx.answerCbQuery();
   ctx.session.broadcastLinkUrl = null;
   ctx.session.broadcastLinkTitle = null;
@@ -371,7 +766,8 @@ async function showBroadcastPreview(ctx) {
 }
 
 broadcastScene.on("text", async (ctx) => {
-  if (!isAdminId(ctx.from.id)) {
+  await ensureRoleState(ctx);
+  if (!ctx.state?.isAdmin) {
     return ctx.reply("⛔ Недостаточно прав");
   }
 
@@ -419,7 +815,8 @@ broadcastScene.on("text", async (ctx) => {
 });
 
 broadcastScene.on("photo", async (ctx) => {
-  if (!isAdminId(ctx.from.id)) {
+  await ensureRoleState(ctx);
+  if (!ctx.state?.isAdmin) {
     return ctx.reply("⛔ Недостаточно прав");
   }
 
@@ -521,6 +918,7 @@ broadcastScene.action("broadcast:send", async (ctx) => {
 });
 
 deleteCourierScene.enter(async (ctx) => {
+  await ensureRoleState(ctx);
   try {
     const approvedUsers = await listApprovedUsers();
 
@@ -543,7 +941,8 @@ deleteCourierScene.enter(async (ctx) => {
 });
 
 changeCourierNameScene.enter(async (ctx) => {
-  if (!isAdminId(ctx.from.id)) {
+  await ensureRoleState(ctx);
+  if (!ctx.state?.isAdmin) {
     await ctx.reply("⛔ Недостаточно прав");
     return ctx.scene.leave();
   }
@@ -577,7 +976,8 @@ changeCourierNameScene.action("changeName:cancel", async (ctx) => {
 });
 
 changeCourierNameScene.action(/^changeName_(.+)$/, async (ctx) => {
-  if (!isAdminId(ctx.from.id)) {
+  await ensureRoleState(ctx);
+  if (!ctx.state?.isAdmin) {
     await ctx.answerCbQuery("Нет прав");
     return;
   }
@@ -593,7 +993,8 @@ changeCourierNameScene.action(/^changeName_(.+)$/, async (ctx) => {
 });
 
 changeCourierNameScene.on("text", async (ctx) => {
-  if (!isAdminId(ctx.from.id)) {
+  await ensureRoleState(ctx);
+  if (!ctx.state?.isAdmin) {
     await ctx.reply("⛔ Недостаточно прав");
     return ctx.scene.leave();
   }
@@ -622,7 +1023,8 @@ changeCourierNameScene.on("text", async (ctx) => {
 
 deleteCourierScene.action(/^delete_(.+)$/, async (ctx) => {
   try {
-    if (!isAdminId(ctx.from.id)) {
+    await ensureRoleState(ctx);
+    if (!ctx.state?.isAdmin) {
       await ctx.answerCbQuery("Нет прав");
       return;
     }
@@ -655,6 +1057,7 @@ deleteCourierScene.action(/^delete_(.+)$/, async (ctx) => {
 
 deleteCourierScene.action("cancel_delete", async (ctx) => {
   try {
+    await ensureRoleState(ctx);
     await ctx.answerCbQuery("Отменено");
     try {
       await ctx.deleteMessage();
@@ -679,7 +1082,8 @@ deleteCourierScene.on("message", async (ctx) => {
 
 // ============ СЦЕНЫ ДЛЯ УПРАВЛЕНИЯ ССЫЛКАМИ ============
 addLinkScene.enter(async (ctx) => {
-  if (!isAdminId(ctx.from.id)) {
+  await ensureRoleState(ctx);
+  if (!ctx.state?.isAdmin) {
     await ctx.reply("⛔ Недостаточно прав");
     return ctx.scene.leave();
   }
@@ -699,7 +1103,8 @@ addLinkScene.action("addLink:cancel", async (ctx) => {
 });
 
 addLinkScene.on("text", async (ctx) => {
-  if (!isAdminId(ctx.from.id)) {
+  await ensureRoleState(ctx);
+  if (!ctx.state?.isAdmin) {
     return ctx.reply("⛔ Недостаточно прав");
   }
   ctx.session = ctx.session || {};
@@ -756,7 +1161,8 @@ addLinkScene.on("text", async (ctx) => {
 });
 
 deleteLinkScene.enter(async (ctx) => {
-  if (!isAdminId(ctx.from.id)) {
+  await ensureRoleState(ctx);
+  if (!ctx.state?.isAdmin) {
     await ctx.reply("⛔ Недостаточно прав");
     return ctx.scene.leave();
   }
@@ -784,7 +1190,8 @@ deleteLinkScene.action("deleteLink:cancel", async (ctx) => {
 });
 
 deleteLinkScene.action(/^deleteLink_(.+)$/, async (ctx) => {
-  if (!isAdminId(ctx.from.id)) {
+  await ensureRoleState(ctx);
+  if (!ctx.state?.isAdmin) {
     await ctx.answerCbQuery("Нет прав");
     return;
   }
@@ -816,7 +1223,8 @@ deleteLinkScene.action(/^deleteLink_(.+)$/, async (ctx) => {
 
 // ============ СЦЕНЫ ДЛЯ УПРАВЛЕНИЯ ОБУЧЕНИЕМ ============
 addTrainingScene.enter(async (ctx) => {
-  if (!isAdminId(ctx.from.id)) {
+  await ensureRoleState(ctx);
+  if (!ctx.state?.isAdmin) {
     await ctx.reply("⛔ Недостаточно прав");
     return ctx.scene.leave();
   }
@@ -884,7 +1292,8 @@ addTrainingScene.action("addTraining:skip", async (ctx) => {
 });
 
 addTrainingScene.on("text", async (ctx) => {
-  if (!isAdminId(ctx.from.id)) {
+  await ensureRoleState(ctx);
+  if (!ctx.state?.isAdmin) {
     return ctx.reply("⛔ Недостаточно прав");
   }
   ctx.session = ctx.session || {};
@@ -970,7 +1379,8 @@ addTrainingScene.on("text", async (ctx) => {
 });
 
 addTrainingScene.on("photo", async (ctx) => {
-  if (!isAdminId(ctx.from.id)) {
+  await ensureRoleState(ctx);
+  if (!ctx.state?.isAdmin) {
     return ctx.reply("⛔ Недостаточно прав");
   }
   ctx.session = ctx.session || {};
@@ -1030,7 +1440,8 @@ addTrainingScene.on("photo", async (ctx) => {
 });
 
 deleteTrainingScene.enter(async (ctx) => {
-  if (!isAdminId(ctx.from.id)) {
+  await ensureRoleState(ctx);
+  if (!ctx.state?.isAdmin) {
     await ctx.reply("⛔ Недостаточно прав");
     return ctx.scene.leave();
   }
@@ -1058,7 +1469,8 @@ deleteTrainingScene.action("deleteTraining:cancel", async (ctx) => {
 });
 
 deleteTrainingScene.action(/^deleteTraining_(.+)$/, async (ctx) => {
-  if (!isAdminId(ctx.from.id)) {
+  await ensureRoleState(ctx);
+  if (!ctx.state?.isAdmin) {
     await ctx.answerCbQuery("Нет прав");
     return;
   }
@@ -1104,9 +1516,51 @@ const stage = new Scenes.Stage([
   deleteLinkScene,
   addTrainingScene,
   deleteTrainingScene,
+  assignRoleScene,
 ]);
 bot.use(session());
 bot.use(stage.middleware());
+
+bot.use(async (ctx, next) => {
+  const fromId = ctx.from?.id;
+  if (!fromId) {
+    return next();
+  }
+
+  const userId = String(fromId);
+  const callbackData = ctx.callbackQuery?.data || "";
+  if (callbackData.startsWith("branch:select_") || callbackData.startsWith("reg:branch_")) {
+    return next();
+  }
+
+  if (ctx.scene && ctx.scene.current && ctx.scene.current.id === "registration") {
+    return next();
+  }
+
+  await ensureRoleState(ctx);
+  const user = ctx.state.currentUser;
+
+  if (user && user.status === "approved" && !user.branch) {
+    const isStartCommand = ctx.updateType === "message" && ctx.message?.text?.startsWith("/start");
+    ctx.session = ctx.session || {};
+
+    if (ctx.updateType === "callback_query") {
+      await ctx.answerCbQuery("Выберите филиал, чтобы продолжить");
+    }
+
+    if (!ctx.session.branchPromptShown && !isStartCommand) {
+      ctx.session.branchPromptShown = true;
+      await ctx.reply("Чтобы продолжить работу, выберите филиал:", buildBranchKeyboard("branch:select"));
+    }
+
+    if (isStartCommand) {
+      return next();
+    }
+    return;
+  }
+
+  return next();
+});
 
 bot.start(async (ctx) => {
   const userId = ctx.from.id.toString();
@@ -1121,15 +1575,27 @@ bot.start(async (ctx) => {
   };
 
   try {
-    if (isAdminId(userId)) {
+    ctx.state = ctx.state || {};
+    const user = ctx.state.currentUser || (await getUserById(userId));
+    ctx.state.currentUser = user;
+    ctx.state.isAdmin = computeAdminFlag(userId, user);
+    ctx.state.isManager = ctx.state.isAdmin || hasManagerRights(user);
+    ctx.state.isBranchManager = hasBranchManagerRights(user);
+
+    if (isAdminId(userId, user)) {
       await logBotStart(bot, userId, userInfo, true);
       return await ctx.reply("👋 Добро пожаловать, администратор!", adminMenu());
     }
 
-    const user = await getUserById(userId);
     if (user?.status === "approved") {
+      if (!user.branch) {
+        ctx.session = ctx.session || {};
+        ctx.session.branchPromptShown = true;
+        await ctx.reply("Чтобы продолжить работу, выберите филиал:", buildBranchKeyboard("branch:select"));
+        return;
+      }
       await logBotStart(bot, userId, { ...userInfo, name: user.name });
-      return await ctx.reply(`${user.name}, Вы сейчас находитесь в главном меню бота. Выберите действие:`, getMainMenuInline());
+      return await ctx.reply(`${user.name}, Вы сейчас находитесь в главном меню бота. Выберите действие:`, getMainMenuInline(user));
     }
 
     if (user?.status === "pending") {
@@ -1157,9 +1623,9 @@ bot.hears("👥 Список курьеров", async (ctx) => {
     last_name: ctx.from.last_name,
   };
 
-  if (!isAdminId(userId)) {
+  if (!isAdminId(userId, ctx.state.currentUser)) {
     await logAction(bot, "попытка доступа к списку курьеров без прав", userId, adminInfo);
-    return await ctx.reply("⛔ Недостаточно прав", getMainMenuInline());
+    return await ctx.reply("⛔ Недостаточно прав", getMainMenuInline(ctx.state.currentUser));
   }
 
   try {
@@ -1172,7 +1638,9 @@ bot.hears("👥 Список курьеров", async (ctx) => {
     let message = "📋 Список зарегистрированных курьеров:\n\n";
     approvedUsers.forEach((u, index) => {
       const secondary = u.username ? u.username : `ID:${u.id}`;
-      message += `${index + 1}. ${u.name} (${secondary})\n`;
+      const branchLabel = getBranchLabel(u.branch);
+      const roleLabel = getRoleLabel(u.role);
+      message += `${index + 1}. ${u.name} — ${roleLabel}, ${branchLabel}\n`;
     });
 
     await ctx.reply(message, adminMenu());
@@ -1183,6 +1651,7 @@ bot.hears("👥 Список курьеров", async (ctx) => {
 });
 
 bot.hears("❌ Удалить курьера", async (ctx) => {
+  await ensureRoleState(ctx);
   const userId = ctx.from.id.toString();
   const adminInfo = {
     name:
@@ -1194,23 +1663,25 @@ bot.hears("❌ Удалить курьера", async (ctx) => {
     last_name: ctx.from.last_name,
   };
 
-  if (!isAdminId(userId)) {
+  if (!ctx.state?.isAdmin) {
     await logAction(bot, "попытка удаления курьера без прав", userId, adminInfo);
-    return await ctx.reply("⛔ Недостаточно прав", getMainMenuInline());
+    return await ctx.reply("⛔ Недостаточно прав", getMainMenuInline(ctx.state.currentUser));
   }
   await ctx.scene.enter("deleteCourier");
 });
 
 bot.hears("✏️ Изменить ФИО курьера", async (ctx) => {
+  await ensureRoleState(ctx);
   const userId = ctx.from.id.toString();
-  if (!isAdminId(userId)) {
+  if (!ctx.state?.isAdmin) {
     await logAction(bot, "попытка входа в изменение ФИО без прав", userId, { username: ctx.from.username });
-    return await ctx.reply("⛔ Недостаточно прав", getMainMenuInline());
+    return await ctx.reply("⛔ Недостаточно прав", getMainMenuInline(ctx.state.currentUser));
   }
   return await ctx.scene.enter("changeCourierName");
 });
 
 bot.hears("📢 Рассылка", async (ctx) => {
+  await ensureRoleState(ctx);
   const userId = ctx.from.id.toString();
   const adminInfo = {
     name:
@@ -1222,17 +1693,18 @@ bot.hears("📢 Рассылка", async (ctx) => {
     last_name: ctx.from.last_name,
   };
 
-  if (!isAdminId(userId)) {
+  if (!ctx.state?.isAdmin) {
     await logAction(bot, "попытка рассылки без прав", userId, adminInfo);
-    return await ctx.reply("⛔ Недостаточно прав", getMainMenuInline());
+    return await ctx.reply("⛔ Недостаточно прав", getMainMenuInline(ctx.state.currentUser));
   }
 
   await ctx.scene.enter("broadcast");
 });
 
 bot.hears("🔗 Управление ссылками", async (ctx) => {
+  await ensureRoleState(ctx);
   const userId = ctx.from.id.toString();
-  if (!isAdminId(userId)) {
+  if (!ctx.state?.isAdmin) {
     return await ctx.reply("⛔ Недостаточно прав");
   }
 
@@ -1258,8 +1730,9 @@ bot.hears("🔗 Управление ссылками", async (ctx) => {
 });
 
 bot.hears("📚 Управление обучением", async (ctx) => {
+  await ensureRoleState(ctx);
   const userId = ctx.from.id.toString();
-  if (!isAdminId(userId)) {
+  if (!ctx.state?.isAdmin) {
     return await ctx.reply("⛔ Недостаточно прав");
   }
 
@@ -1283,6 +1756,25 @@ bot.hears("📚 Управление обучением", async (ctx) => {
   const keyboard = createPaginatedKeyboard(materials, 0, 6, "training", true);
   await ctx.reply("📚 Обучение:", keyboard);
 });
+
+bot.hears("🎯 Назначить роль", async (ctx) => {
+  await ensureRoleState(ctx);
+  const userId = ctx.from.id.toString();
+  const actingUser = ctx.state?.currentUser || (await getUserById(userId));
+  if (!isAdminId(userId, actingUser)) {
+    await logAction(bot, "попытка назначения роли без прав", userId, {
+      name:
+        ctx.from.first_name && ctx.from.last_name
+          ? `${ctx.from.first_name} ${ctx.from.last_name}`
+          : ctx.from.first_name || ctx.from.username || "Неизвестно",
+      username: ctx.from.username,
+      first_name: ctx.from.first_name,
+      last_name: ctx.from.last_name,
+    });
+    return await ctx.reply("⛔ Недостаточно прав", adminMenu());
+  }
+  return ctx.scene.enter("assignRole");
+});
 bot.hears(["📋 График: текущая неделя", "📋 График: следующая неделя"], async (ctx) => {
   const userId = ctx.from.id.toString();
   const adminInfo = {
@@ -1295,9 +1787,9 @@ bot.hears(["📋 График: текущая неделя", "📋 График:
     last_name: ctx.from.last_name,
   };
 
-  if (!isAdminId(userId)) {
+  if (!ctx.state?.isAdmin) {
     await logAction(bot, "попытка просмотра графика без прав", userId, adminInfo);
-    return ctx.reply("⛔ Недостаточно прав", getMainMenuInline());
+    return ctx.reply("⛔ Недостаточно прав", getMainMenuInline(ctx.state.currentUser));
   }
 
   const nextWeek = ctx.message.text.includes("следующая");
@@ -1315,6 +1807,54 @@ bot.on("callback_query", async (ctx) => {
   const data = ctx.callbackQuery.data;
   const userId = ctx.from.id.toString();
   ctx.session = ctx.session || {};
+  await ensureRoleState(ctx);
+
+  if (data.startsWith("branch:select_")) {
+    const match = data.match(/^branch:select_(.+)$/);
+    const branchId = match ? match[1] : null;
+    const branch = BRANCHES.find((b) => b.id === branchId);
+    if (!branch) {
+      await ctx.answerCbQuery("Неизвестный филиал, попробуйте снова");
+      return;
+    }
+
+    const user = ctx.state?.currentUser || (await getUserById(userId));
+    const userInfo = {
+      name:
+        user?.name ||
+        (ctx.from.first_name && ctx.from.last_name
+          ? `${ctx.from.first_name} ${ctx.from.last_name}`
+          : ctx.from.first_name || ctx.from.username || "Неизвестно"),
+      username: ctx.from.username,
+      first_name: ctx.from.first_name,
+      last_name: ctx.from.last_name,
+    };
+
+    await updateUserBranch(userId, branch.id);
+    ctx.session.branchPromptShown = false;
+    if (ctx.state) {
+      ctx.state.currentUser = user ? { ...user, branch: branch.id } : null;
+      ctx.state.isAdmin = computeAdminFlag(userId, ctx.state.currentUser);
+      ctx.state.isManager = ctx.state.isAdmin || hasManagerRights(ctx.state.currentUser);
+      ctx.state.isBranchManager = hasBranchManagerRights(ctx.state.currentUser);
+    }
+
+    await logAction(bot, "Выбор филиала", userId, userInfo, { branch: branch.id });
+
+    await ctx.answerCbQuery("Филиал сохранён");
+    try {
+      await ctx.editMessageText(`Филиал установлен: ${branch.label}`);
+    } catch (_) {}
+
+    const displayName = user?.name || userInfo.name || "";
+
+    if (user?.status === "approved") {
+      await ctx.reply(`${displayName}, Вы сейчас находитесь в главном меню бота. Выберите действие:`, getMainMenuInline(ctx.state.currentUser));
+    } else {
+      await ctx.reply("Филиал сохранён. Ожидайте подтверждения администратора.");
+    }
+    return;
+  }
 
   if (
     data.startsWith("menu:") ||
@@ -1338,21 +1878,29 @@ bot.on("callback_query", async (ctx) => {
       ctx.session.supportChatActive = false;
       await ctx.answerCbQuery("Диалог завершён");
       try {
-        await ctx.editMessageText("Диалог с администратором завершён.", getMainMenuInline());
+        await ctx.editMessageText("Диалог с администратором завершён.", getMainMenuInline(ctx.state.currentUser));
       } catch (_) {}
       return;
     }
     if (data === "menu:main") {
       const userId = ctx.from.id.toString();
       const user = await getUserById(userId);
-      await ctx.editMessageText(`${user?.name || ""}, Вы сейчас находитесь в главном меню бота.\n\nВыберите действие:`, getMainMenuInline());
+      await ctx.editMessageText(`${user?.name || ""}, Вы сейчас находитесь в главном меню бота.\n\nВыберите действие:`, getMainMenuInline(user));
       return;
     }
     if (data === "menu:report") {
+      if (!canAccessReports(ctx.state.currentUser)) {
+        await ctx.answerCbQuery("Недоступно для вашей роли");
+        return;
+      }
       await ctx.editMessageText(`Отчет по вашей заработной плате.\n\nВыберите действие:`, getReportMenuInline());
       return;
     }
     if (data.startsWith("report:")) {
+      if (!canAccessReports(ctx.state.currentUser)) {
+        await ctx.answerCbQuery("Недоступно для вашей роли");
+        return;
+      }
       const user = await getUserById(userId);
       const userInfo = {
         name: user?.name || "Неизвестно",
@@ -1392,7 +1940,71 @@ bot.on("callback_query", async (ctx) => {
       return;
     }
     if (data === "menu:schedule") {
-      await ctx.editMessageText(`Просмотр и отправка графика.\n\nВыберите действие:`, getScheduleMenuInline());
+      await ctx.editMessageText(`Просмотр и отправка графика.\n\nВыберите действие:`, getScheduleMenuInline(ctx.state.currentUser));
+      return;
+    }
+    if (data === "schedule:branch") {
+      await ensureRoleState(ctx);
+      if (!hasBranchManagerRights(ctx.state.currentUser)) {
+        await ctx.answerCbQuery("⛔ Недостаточно прав");
+        return;
+      }
+      const branchId = ctx.state.currentUser?.branch;
+      if (!branchId) {
+        await ctx.answerCbQuery();
+        await ctx.editMessageText("Сначала назначьте филиал, чтобы просматривать график команды.", getBackInlineMenu("menu:schedule"));
+        return;
+      }
+      const branchLabel = getBranchLabel(branchId);
+      await ctx.editMessageText(
+        `Выберите период для филиала ${branchLabel}:`,
+        Markup.inlineKeyboard([
+          [Markup.button.callback("Текущая неделя", "schedule:branch_current")],
+          [Markup.button.callback("Следующая неделя", "schedule:branch_next")],
+          [Markup.button.callback("◀️ Назад", "menu:schedule")],
+        ])
+      );
+      return;
+    }
+    if (data === "schedule:branch_current" || data === "schedule:branch_next") {
+      await ensureRoleState(ctx);
+      if (!hasBranchManagerRights(ctx.state.currentUser)) {
+        await ctx.answerCbQuery("⛔ Недостаточно прав");
+        return;
+      }
+      const branchId = ctx.state.currentUser?.branch;
+      if (!branchId) {
+        await ctx.answerCbQuery();
+        await ctx.editMessageText("Сначала назначьте филиал, чтобы просматривать график команды.", getBackInlineMenu("menu:schedule"));
+        return;
+      }
+      const nextWeek = data.endsWith("next");
+      const branchLabel = getBranchLabel(branchId);
+      await ctx.answerCbQuery();
+      await ctx.editMessageText("⏳ Получаю график филиала...", getBackInlineMenu("menu:schedule"));
+      try {
+        await logScheduleAction(
+          bot,
+          userId,
+          {
+            name:
+              ctx.state.currentUser?.name ||
+              (ctx.from.first_name && ctx.from.last_name
+                ? `${ctx.from.first_name} ${ctx.from.last_name}`
+                : ctx.from.first_name || ctx.from.username || "Неизвестно"),
+            username: ctx.from.username,
+          },
+          `просмотр графика филиала ${branchLabel}`,
+          { branchId, nextWeek }
+        );
+        const scheduleText = await getBranchScheduleText(SPREADSHEET_ID, branchId, branchLabel, nextWeek);
+        await ctx.editMessageText(scheduleText, {
+          parse_mode: "Markdown",
+          ...getBackInlineMenu("menu:schedule"),
+        });
+      } catch (e) {
+        await ctx.editMessageText("❗ " + e.message, getBackInlineMenu("menu:schedule"));
+      }
       return;
     }
     if (data === "menu:links" || data.startsWith("links:page_")) {
@@ -1404,7 +2016,7 @@ bot.on("callback_query", async (ctx) => {
         }
         const page = data.startsWith("links:page_") ? parseInt(data.split("_")[1]) : 0;
         const itemsPerPage = 6;
-        const isAdmin = isAdminId(userId);
+        const isAdmin = ctx.state?.isAdmin ?? isAdminId(userId, ctx.state?.currentUser);
 
         const user = await getUserById(userId);
         const userInfo = {
@@ -1426,7 +2038,7 @@ bot.on("callback_query", async (ctx) => {
       return;
     }
     if (data === "links:add") {
-      if (!isAdminId(userId)) {
+      if (!ctx.state?.isAdmin) {
         await ctx.answerCbQuery("⛔ Недостаточно прав");
         return;
       }
@@ -1434,7 +2046,7 @@ bot.on("callback_query", async (ctx) => {
       return ctx.scene.enter("addLink");
     }
     if (data === "links:delete") {
-      if (!isAdminId(userId)) {
+      if (!ctx.state?.isAdmin) {
         await ctx.answerCbQuery("⛔ Недостаточно прав");
         return;
       }
@@ -1454,7 +2066,7 @@ bot.on("callback_query", async (ctx) => {
         }
         const page = data.startsWith("training:page_") ? parseInt(data.split("_")[1]) : 0;
         const itemsPerPage = 6;
-        const isAdmin = isAdminId(userId);
+        const isAdmin = ctx.state?.isAdmin ?? isAdminId(userId, ctx.state?.currentUser);
 
         const user = await getUserById(userId);
         const userInfo = {
@@ -1476,7 +2088,7 @@ bot.on("callback_query", async (ctx) => {
       return;
     }
     if (data === "training:add") {
-      if (!isAdminId(userId)) {
+      if (!ctx.state?.isAdmin) {
         await ctx.answerCbQuery("⛔ Недостаточно прав");
         return;
       }
@@ -1484,7 +2096,7 @@ bot.on("callback_query", async (ctx) => {
       return ctx.scene.enter("addTraining");
     }
     if (data === "training:delete") {
-      if (!isAdminId(userId)) {
+      if (!ctx.state?.isAdmin) {
         await ctx.answerCbQuery("⛔ Недостаточно прав");
         return;
       }
@@ -1548,6 +2160,11 @@ bot.on("callback_query", async (ctx) => {
       return;
     }
     if (data === "schedule:view:current" || data === "schedule:view:next") {
+      await ensureRoleState(ctx);
+      if (getUserRole(ctx.state.currentUser) === ROLES.LOGIST) {
+        await ctx.answerCbQuery("Доступен только график филиала");
+        return;
+      }
       const user = await getUserById(userId);
       const userInfo = {
         name: user?.name || "Неизвестно",
@@ -1569,6 +2186,11 @@ bot.on("callback_query", async (ctx) => {
       return;
     }
     if (data === "schedule:view") {
+      await ensureRoleState(ctx);
+      if (getUserRole(ctx.state.currentUser) === ROLES.LOGIST) {
+        await ctx.answerCbQuery("Доступен только график филиала");
+        return;
+      }
       await ctx.editMessageText(
         "Выберите неделю:",
         Markup.inlineKeyboard([
@@ -1580,6 +2202,11 @@ bot.on("callback_query", async (ctx) => {
       return;
     }
     if (data === "schedule:send") {
+      await ensureRoleState(ctx);
+      if (getUserRole(ctx.state.currentUser) === ROLES.LOGIST) {
+        await ctx.answerCbQuery("⛔ Недостаточно прав");
+        return;
+      }
       const { from, to } = getWeekBounds(true);
       const user = await getUserById(userId);
       const userInfo = {
@@ -1603,29 +2230,49 @@ bot.on("callback_query", async (ctx) => {
       return;
     }
   }
-  if (!isAdminId(userId)) {
-    return await ctx.answerCbQuery("⛔ Недостаточно прав");
-  }
+
+  const isAdminCtx = ctx.state?.isAdmin ?? false;
+  const isBranchManagerCtx = hasBranchManagerRights(ctx.state?.currentUser);
 
   // Обработчики для управления ссылками и обучением (админ)
   if (data === "admin:addLink") {
+    if (!isAdminCtx) {
+      await ctx.answerCbQuery("⛔ Недостаточно прав");
+      return;
+    }
     await ctx.answerCbQuery();
     return ctx.scene.enter("addLink");
   }
   if (data === "admin:deleteLink") {
+    if (!isAdminCtx) {
+      await ctx.answerCbQuery("⛔ Недостаточно прав");
+      return;
+    }
     await ctx.answerCbQuery();
     return ctx.scene.enter("deleteLink");
   }
   if (data === "admin:addTraining") {
+    if (!isAdminCtx) {
+      await ctx.answerCbQuery("⛔ Недостаточно прав");
+      return;
+    }
     await ctx.answerCbQuery();
     return ctx.scene.enter("addTraining");
   }
   if (data === "admin:deleteTraining") {
+    if (!isAdminCtx) {
+      await ctx.answerCbQuery("⛔ Недостаточно прав");
+      return;
+    }
     await ctx.answerCbQuery();
     return ctx.scene.enter("deleteTraining");
   }
 
   if (data.startsWith("support_reply:")) {
+    if (!isAdminCtx) {
+      await ctx.answerCbQuery("⛔ Недостаточно прав");
+      return;
+    }
     const targetId = data.split(":")[1];
     ctx.session = ctx.session || {};
     ctx.session.supportReplyTarget = targetId;
@@ -1640,6 +2287,7 @@ bot.on("callback_query", async (ctx) => {
   if (data.startsWith("approve_") || data.startsWith("reject_")) {
     const idToChange = data.split("_")[1];
     const user = await getUserById(idToChange);
+    const actingUser = ctx.state?.currentUser || (await getUserById(userId));
     const adminInfo = {
       name:
         ctx.from.first_name && ctx.from.last_name
@@ -1652,6 +2300,26 @@ bot.on("callback_query", async (ctx) => {
 
     if (!user) {
       return await ctx.answerCbQuery("Пользователь не найден");
+    }
+
+    const isAdmin = isAdminCtx;
+    const isBranchManager = hasBranchManagerRights(actingUser);
+
+    if (!isAdmin && !isBranchManager) {
+      await ctx.answerCbQuery("⛔ Недостаточно прав");
+      return;
+    }
+
+    if (!isAdmin && isBranchManager) {
+      const managerBranch = actingUser?.branch;
+      if (!managerBranch) {
+        await ctx.answerCbQuery("Назначьте филиал, чтобы обрабатывать заявки");
+        return;
+      }
+      if (user.branch && user.branch !== managerBranch) {
+        await ctx.answerCbQuery("Это заявка другого филиала");
+        return;
+      }
     }
 
     try {
@@ -1669,7 +2337,7 @@ bot.on("callback_query", async (ctx) => {
           await bot.telegram.sendMessage(
             idToChange,
             `Ваша заявка одобрена!\nТеперь вам доступны все возможности нашего бота. Добро пожаловать :)\n\nВыберите действие:`,
-            getMainMenuInline()
+            getMainMenuInline(user)
           );
         } catch (err) {
           console.error(`Не удалось отправить уведомление об одобрении курьеру ${idToChange}:`, err.message);
@@ -1693,6 +2361,21 @@ bot.on("callback_query", async (ctx) => {
           console.error(`Не удалось отправить уведомление об отказе курьеру ${idToChange}:`, err.message);
           await logError(bot, err, userId, adminInfo, "Отправка уведомления об отказе");
         }
+      }
+
+      const pending = pendingApprovalNotifications.get(idToChange);
+      if (pending && pending.length) {
+        for (const note of pending) {
+          if (!note || !note.chatId || !note.messageId) continue;
+          try {
+            await bot.telegram.deleteMessage(String(note.chatId), note.messageId);
+          } catch (delErr) {
+            if (delErr?.response?.error_code !== 400) {
+              console.warn("Не удалось удалить уведомление о заявке:", delErr.message);
+            }
+          }
+        }
+        pendingApprovalNotifications.delete(idToChange);
       }
     } catch (err) {
       await logError(bot, err, userId, adminInfo, "Обработка подтверждения/отклонения пользователя");
@@ -1753,7 +2436,7 @@ bot.on("text", async (ctx) => {
 
     if (!text) {
       await logAction(bot, "попытка отправки пустого сообщения в поддержку", userId, userInfo);
-      return ctx.reply("Пустое сообщение. Отмена.", getMainMenuInline());
+      return ctx.reply("Пустое сообщение. Отмена.", getMainMenuInline(ctx.state.currentUser));
     }
 
     try {
@@ -1801,10 +2484,22 @@ bot.on("text", async (ctx) => {
 
       ctx.session.currentSheet = await ensureWeekSheetAndAsk(SPREADSHEET_ID, ctx.chat.id, ctx.telegram, false, !!ctx.session.scheduleNextWeek);
       await parseAndAppend(SPREADSHEET_ID, ctx.session.currentSheet, ctx.message.text.trim(), userId);
-      await ctx.telegram.editMessageText(ctx.chat.id, ctx.session.lastInlineMsgId, null, "✅ График сохранён!", getScheduleMenuInline());
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        ctx.session.lastInlineMsgId,
+        null,
+        "✅ График сохранён!",
+        getScheduleMenuInline(ctx.state.currentUser)
+      );
     } catch (e) {
       await logError(bot, e, userId, userInfo, "Сохранение графика");
-      await ctx.telegram.editMessageText(ctx.chat.id, ctx.session.lastInlineMsgId, null, "❗ " + e.message, getScheduleMenuInline());
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        ctx.session.lastInlineMsgId,
+        null,
+        "❗ " + e.message,
+        getScheduleMenuInline(ctx.state.currentUser)
+      );
     }
     return;
   }
@@ -1825,10 +2520,22 @@ bot.on("text", async (ctx) => {
 
       ctx.session.currentSheet = await ensureWeekSheetAndAsk(SPREADSHEET_ID, ctx.chat.id, ctx.telegram, false, !!ctx.session.scheduleNextWeek);
       await upsertSchedule(SPREADSHEET_ID, ctx.session.currentSheet, ctx.message.text.trim(), userId, ctx.telegram);
-      await ctx.telegram.editMessageText(ctx.chat.id, ctx.session.lastInlineMsgId, null, "✅ График обновлён!", getScheduleMenuInline());
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        ctx.session.lastInlineMsgId,
+        null,
+        "✅ График обновлён!",
+        getScheduleMenuInline(ctx.state.currentUser)
+      );
     } catch (e) {
       await logError(bot, e, userId, userInfo, "Обновление графика");
-      await ctx.telegram.editMessageText(ctx.chat.id, ctx.session.lastInlineMsgId, null, "❗ " + e.message, getScheduleMenuInline());
+      await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        ctx.session.lastInlineMsgId,
+        null,
+        "❗ " + e.message,
+        getScheduleMenuInline(ctx.state.currentUser)
+      );
     }
     return;
   }
@@ -2189,12 +2896,25 @@ bot.catch(async (err, ctx) => {
   };
 
   await logError(bot, err, userId, userInfo, "Глобальная ошибка бота");
-  await ctx.reply("⚠️ Произошла ошибка. Попробуйте позже.", getMainMenuInline());
+  await ctx.reply("⚠️ Произошла ошибка. Попробуйте позже.", getMainMenuInline(ctx.state?.currentUser));
 });
 
 initSchema()
-  .then(() => bot.launch())
+  .then(async () => {
+    try {
+      await bot.launch();
+    } catch (launchErr) {
+      console.error("Ошибка запуска бота:", launchErr.message);
+    }
+
+    try {
+      await notifyUsersWithoutBranch();
+    } catch (notifyErr) {
+      console.error("Не удалось запустить напоминание о выборе филиала:", notifyErr.message);
+    }
+  })
   .catch((err) => {
+    console.error("Не удалось инициализировать схему:", err.message);
     process.exit(1);
   });
 

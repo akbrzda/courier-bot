@@ -1,6 +1,6 @@
 const { google } = require("googleapis");
 const moment = require("moment-timezone");
-const { getUserById } = require("./services.users");
+const { getUserById, listApprovedUsers } = require("./services.users");
 
 const auth = new google.auth.GoogleAuth({
   keyFile: "creds.json",
@@ -314,6 +314,40 @@ async function getAdminScheduleText(spreadsheetId, nextWeek = false) {
   return text;
 }
 
+async function getBranchScheduleText(spreadsheetId, branchId, branchLabel = "Филиал", nextWeek = false) {
+  const { from, to } = getWeekBounds(nextWeek);
+  const sheetName = `${from.format("DD.MM")}-${to.format("DD.MM")}`;
+  const res = await sheets.spreadsheets.values.get({ spreadsheetId, range: `'${sheetName}'!A4:I27` });
+  const rows = res.data.values || [];
+
+  const approvedUsers = await listApprovedUsers();
+  const branchNames = new Set(
+    approvedUsers
+      .filter((u) => u.branch === branchId)
+      .map((u) => u.name)
+      .filter(Boolean)
+  );
+
+  if (!branchNames.size) {
+    return `Для филиала ${branchLabel} пока нет курьеров с заполненным графиком.`;
+  }
+
+  const filteredRows = rows.filter((row) => row && row[1] && branchNames.has(row[1]));
+  if (!filteredRows.length) {
+    return `В графике на период *${from.format("DD.MM")}–${to.format("DD.MM")}* нет записей по филиалу ${branchLabel}.`;
+  }
+
+  let text = `📋 График филиала ${branchLabel} на период *${from.format("DD.MM")}–${to.format("DD.MM")}*:\n\n`;
+  for (const r of filteredRows) {
+    const times = r
+      .slice(2, 9)
+      .map((t, i) => `${DAY_MAP_SHORT[i]}: ${t}`)
+      .join("\n");
+    text += `*${r[1]}*\n${times}\n\n`;
+  }
+  return text;
+}
+
 module.exports = {
   ensureWeekSheetAndAsk,
   parseAndAppend,
@@ -322,6 +356,7 @@ module.exports = {
   parseSchedule,
   getScheduleText,
   getAdminScheduleText,
+  getBranchScheduleText,
   isScheduleSubmissionAllowed,
   getWeekBounds,
   sheetExists,

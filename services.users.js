@@ -6,12 +6,20 @@ async function getUserById(userId) {
 }
 
 async function upsertUserBasic(userId, payload) {
-  const { name, status = "pending", username = null, first_name = null, last_name = null } = payload;
+  const {
+    name,
+    status = "pending",
+    username = null,
+    first_name = null,
+    last_name = null,
+    branch = null,
+    role = "courier",
+  } = payload;
   await pool.query(
-    `INSERT INTO users (id, name, status, username, first_name, last_name)
-     VALUES (?,?,?,?,?,?)
-     ON DUPLICATE KEY UPDATE name=VALUES(name), status=VALUES(status), username=VALUES(username), first_name=VALUES(first_name), last_name=VALUES(last_name)`,
-    [userId, name, status, username, first_name, last_name]
+    `INSERT INTO users (id, name, status, username, first_name, last_name, branch, role)
+     VALUES (?,?,?,?,?,?,?,?)
+     ON DUPLICATE KEY UPDATE name=VALUES(name), status=VALUES(status), username=VALUES(username), first_name=VALUES(first_name), last_name=VALUES(last_name), branch=VALUES(branch), role=VALUES(role)`,
+    [userId, name, status, username, first_name, last_name, branch, role]
   );
 }
 
@@ -24,12 +32,42 @@ async function deleteUser(userId) {
 }
 
 async function listApprovedUsers() {
-  const [rows] = await pool.query("SELECT id, name, username FROM users WHERE status='approved' ORDER BY name");
+  const [rows] = await pool.query(
+    "SELECT id, name, username, branch, role FROM users WHERE status='approved' ORDER BY name"
+  );
   return rows;
 }
 
 async function listAllUsers() {
-  const [rows] = await pool.query("SELECT id, name, username, status FROM users ORDER BY name");
+  const [rows] = await pool.query("SELECT id, name, username, status, branch, role FROM users ORDER BY name");
+  return rows;
+}
+
+async function listApprovedUsersWithoutBranch() {
+  const [rows] = await pool.query(
+    "SELECT id, name, username FROM users WHERE status='approved' AND branch IS NULL ORDER BY name"
+  );
+  return rows;
+}
+
+async function updateUserBranch(userId, branch) {
+  await pool.query("UPDATE users SET branch=? WHERE id=?", [branch, userId]);
+}
+
+async function updateUserRole(userId, role) {
+  await pool.query("UPDATE users SET role=? WHERE id=?", [role, userId]);
+}
+
+async function listUsersByRole(role) {
+  const [rows] = await pool.query("SELECT id, name, username, branch, status, role FROM users WHERE role=? ORDER BY name", [role]);
+  return rows;
+}
+
+async function listUsersByRoleAndBranch(role, branch) {
+  const [rows] = await pool.query(
+    "SELECT id, name, username, branch, status, role FROM users WHERE role=? AND branch=? ORDER BY name",
+    [role, branch]
+  );
   return rows;
 }
 
@@ -51,4 +89,9 @@ module.exports = {
   deleteUser,
   listApprovedUsers,
   listAllUsers,
+  listApprovedUsersWithoutBranch,
+  updateUserBranch,
+  updateUserRole,
+  listUsersByRole,
+  listUsersByRoleAndBranch,
 };

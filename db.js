@@ -21,10 +21,32 @@ async function initSchema() {
       username VARCHAR(255) NULL,
       first_name VARCHAR(255) NULL,
       last_name VARCHAR(255) NULL,
+      branch ENUM('surgut_1','surgut_2','surgut_3') NULL,
+      role ENUM('courier','senior','logist','admin') NOT NULL DEFAULT 'courier',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
   `);
+
+  try {
+    await pool.query(
+      "ALTER TABLE users ADD COLUMN branch ENUM('surgut_1','surgut_2','surgut_3') NULL AFTER last_name"
+    );
+  } catch (error) {
+    if (error && error.code !== 'ER_DUP_FIELDNAME') {
+      throw error;
+    }
+  }
+
+  try {
+    await pool.query(
+      "ALTER TABLE users ADD COLUMN role ENUM('courier','senior','logist','admin') NOT NULL DEFAULT 'courier' AFTER branch"
+    );
+  } catch (error) {
+    if (error && error.code !== 'ER_DUP_FIELDNAME') {
+      throw error;
+    }
+  }
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS links (
