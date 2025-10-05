@@ -33,12 +33,22 @@ async function listAllUsers() {
   return rows;
 }
 
+async function updateUserName(userId, newName) {
+  const name = typeof newName === "string" ? newName.trim() : null;
+  if (!name) throw new Error("Пустое ФИО");
+  const parts = name.split(/\s+/).filter(Boolean);
+  const first_name = parts[0] || null;
+  const last_name = parts.length > 1 ? parts.slice(1).join(" ") : null;
+
+  await pool.query("UPDATE users SET name=?, first_name=?, last_name=? WHERE id=?", [name, first_name, last_name, userId]);
+}
+
 module.exports = {
   getUserById,
   upsertUserBasic,
+  updateUserName,
   setUserStatus,
   deleteUser,
   listApprovedUsers,
   listAllUsers,
 };
-

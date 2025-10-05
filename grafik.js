@@ -1,16 +1,7 @@
 const { google } = require("googleapis");
 const moment = require("moment-timezone");
-const winston = require("winston");
-const { pool } = require("./db");
+const { getUserById } = require("./services.users");
 
-const logger = winston.createLogger({ level: "info", transports: [new winston.transports.Console()] });
-
-async function getUserByIdDb(userId) {
-  const [rows] = await pool.query("SELECT id, name, status FROM users WHERE id=? LIMIT 1", [userId]);
-  return rows[0] || null;
-}
-
-// Инициализация Google Sheets API
 const auth = new google.auth.GoogleAuth({
   keyFile: "creds.json",
   scopes: ["https://www.googleapis.com/auth/spreadsheets"],
@@ -18,42 +9,58 @@ const auth = new google.auth.GoogleAuth({
 const sheets = google.sheets({ version: "v4", auth });
 
 const DAY_MAP_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
+const TEMPLATE_SHEET_NAME = process.env.TEMPLATE_SHEET_NAME || "Template";
 
-// Проверка окна отправки графика
 function isScheduleSubmissionAllowed() {
   const now = moment().tz("Asia/Yekaterinburg");
-  const day = now.isoWeekday(); // 1=Пн ... 7=Вс
+  const day = now.isoWeekday();
   const time = now.format("HH:mm");
-  logger.info(`[Окно приёма] День: ${day}, Время: ${time}`);
-  if (
-    (day === 4 && time >= "22:00") ||
-    day === 5 ||
-    day === 6 ||
-    (day === 7 && time < "12:00")
-  ) {
-    logger.info("Разрешено отправлять график.");
+  if ((day === 4 && time >= "22:00") || day === 5 || day === 6 || (day === 7 && time < "12:00")) {
     return true;
   }
-  logger.info("Запрет на отправку графика!");
   return false;
 }
 
-// Получение границ недели
 function getWeekBounds(nextWeek = false) {
   const now = moment().tz("Asia/Yekaterinburg");
-  const mon = now.clone().startOf("isoWeek").add(nextWeek ? 1 : 0, "weeks");
+  const mon = now
+    .clone()
+    .startOf("isoWeek")
+    .add(nextWeek ? 1 : 0, "weeks");
   const sun = mon.clone().add(6, "days");
-  logger.info(`Week bounds nextWeek=${nextWeek} from=${mon.format()} to=${sun.format()}`);
   return { from: mon, to: sun };
 }
 
-// Проверка наличия листа
 async function sheetExists(spreadsheetId, title) {
   const meta = await sheets.spreadsheets.get({ spreadsheetId });
   return meta.data.sheets.some((sh) => sh.properties.title === title);
 }
 
-// Дублирование листа
+async function loadDataRows(spreadsheetId, sheetName) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `'${sheetName}'!A4:I27`,
+  });
+  return res.data.values || [];
+}
+
+function wait(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function withRetry(fn, attempts = 3, delay = 120) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      if (i < attempts - 1) await wait(delay);
+    }
+  }
+  throw lastErr;
+}
+
 async function duplicateWeekSheet(spreadsheetId, sourceTitle, newTitle, from, to) {
   const meta = await sheets.spreadsheets.get({ spreadsheetId });
   const sourceSheet = meta.data.sheets.find((sh) => sh.properties.title === sourceTitle);
@@ -86,7 +93,6 @@ async function duplicateWeekSheet(spreadsheetId, sourceTitle, newTitle, from, to
   });
 }
 
-// Создание нового листа
 async function createWeekSheet(spreadsheetId, { from, to }) {
   const title = `${from.format("DD.MM")}-${to.format("DD.MM")}`;
   await sheets.spreadsheets.batchUpdate({
@@ -113,82 +119,84 @@ async function createWeekSheet(spreadsheetId, { from, to }) {
   return title;
 }
 
-// Подготовка листа для графика
 async function ensureWeekSheetAndAsk(spreadsheetId, chatId, telegram, withPrompt = true, nextWeek = true) {
- /* if (!isScheduleSubmissionAllowed()) {
-    await telegram.sendMessage(chatId, "График можно отправлять только с 22:00 четверга и до 12:00 воскресенья.");
-    return;
-  }*/
   const { from, to } = getWeekBounds(nextWeek);
   const sheetName = `${from.format("DD.MM")}-${to.format("DD.MM")}`;
   const prev = getWeekBounds(false);
   const prevTitle = `${prev.from.format("DD.MM")}-${prev.to.format("DD.MM")}`;
   if (!(await sheetExists(spreadsheetId, sheetName))) {
-    if (await sheetExists(spreadsheetId, prevTitle)) {
-      await duplicateWeekSheet(spreadsheetId, prevTitle, sheetName, from, to);
+    if (TEMPLATE_SHEET_NAME && (await sheetExists(spreadsheetId, TEMPLATE_SHEET_NAME))) {
+      await duplicateWeekSheet(spreadsheetId, TEMPLATE_SHEET_NAME, sheetName, from, to);
     } else {
       await createWeekSheet(spreadsheetId, { from, to });
     }
   }
-
   return sheetName;
 }
 
-// Парсер расписания
 function parseSchedule(text) {
-  const lines = text
+  const lines = String(text || "")
     .split("\n")
     .map((l) => l.trim())
     .filter(Boolean);
+
   const hours = Array(7).fill("вых");
-  for (const line of lines) {
-    const [dayPart, time] = line.split(":").map((p) => p.trim());
-    const idx = DAY_MAP_SHORT.indexOf(dayPart);
-    if (idx === -1) throw new Error(`Непонятный день: ${dayPart}`);
-    hours[idx] = time;
+
+  // normalize short day keys to lowercase two-letter keys: пн, вт, ср, ...
+  const shortKeys = DAY_MAP_SHORT.map((d) => d.toLowerCase().slice(0, 2));
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    const sep = line.indexOf(":");
+    if (sep === -1) throw new Error(`Неправильный формат строки: ${line}`);
+    const dayPartRaw = line.slice(0, sep).trim().toLowerCase().replace(/\./g, "").replace(/\s+/g, "");
+    const time = line.slice(sep + 1).trim();
+
+    const key = dayPartRaw.slice(0, 2);
+    const idx = shortKeys.indexOf(key);
+    if (idx === -1) throw new Error(`Непонятный день: ${dayPartRaw}`);
+    hours[idx] = time || hours[idx];
   }
+
   return hours;
 }
 
-// Добавление расписания
 async function parseAndAppend(spreadsheetId, sheetName, text, chatId) {
-  const courier = await getUserByIdDb(String(chatId));
-  if (!courier || courier.status !== "approved") {
-    throw new Error("У вас нет доступа к добавлению графика.");
-  }
-  const fio = courier.name;
-  const existing = await sheets.spreadsheets.values.get({
-    spreadsheetId,
-    range: `'${sheetName}'!B4:B`,
-  });
-  const names = (existing.data.values || []).map((r) => r[0]);
-  if (names.includes(fio)) {
-    throw new Error("Вы уже отправили график на этот период. Чтобы его просмотреть, нажмите кнопку 'Посмотреть график'.");
-  }
-  const pp = names.length + 1;
-  const hours = parseSchedule(text);
-  const row = [pp, fio, ...hours];
-  await sheets.spreadsheets.values.append({
-    spreadsheetId,
-    range: `'${sheetName}'!A4:I`,
-    valueInputOption: "USER_ENTERED",
-    resource: { values: [row] },
-  });
+  return await withRetry(
+    async () => {
+      const courier = await getUserById(String(chatId));
+      if (!courier || courier.status !== "approved") {
+        throw new Error("У вас нет доступа к добавлению графика.");
+      }
+      const fio = courier.name;
+      const rows = await loadDataRows(spreadsheetId, sheetName);
+      const names = rows.map((r) => (r && r[1] ? r[1] : undefined)).filter(Boolean);
+      if (names.includes(fio)) {
+        throw new Error("Вы уже отправили график на этот период. Чтобы его просмотреть, нажмите кнопку 'Посмотреть график'.");
+      }
+      const pp = names.length + 1;
+      const hours = parseSchedule(text);
+      const row = [pp, fio, ...hours];
+      await sheets.spreadsheets.values.append({
+        spreadsheetId,
+        range: `'${sheetName}'!A4:I`,
+        valueInputOption: "USER_ENTERED",
+        resource: { values: [row] },
+      });
+    },
+    3,
+    150
+  );
 }
 
-// Обновление расписания (замена)
 async function upsertSchedule(spreadsheetId, sheetName, text, chatId, telegram) {
-  const courier = await getUserByIdDb(String(chatId));
+  const courier = await getUserById(String(chatId));
   if (!courier || courier.status !== "approved") {
     await telegram.sendMessage(chatId, "У вас нет доступа к изменению графика.");
     return;
   }
   const fio = courier.name;
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId,
-    range: `'${sheetName}'!B4:B27`,
-  });
-  const rows = res.data.values || [];
+  const rows = await loadDataRows(spreadsheetId, sheetName);
 
   let rowIdx = null;
   let names = [];
@@ -199,11 +207,8 @@ async function upsertSchedule(spreadsheetId, sheetName, text, chatId, telegram) 
 
   let pp = null;
   if (rowIdx !== null) {
-    const ppRes = await sheets.spreadsheets.values.get({
-      spreadsheetId,
-      range: `'${sheetName}'!A${rowIdx}:A${rowIdx}`,
-    });
-    pp = (ppRes.data.values && ppRes.data.values[0] && ppRes.data.values[0][0]) || names.length;
+    const rowVals = rows[rowIdx - 4] || [];
+    pp = rowVals[0] || names.length;
   } else {
     for (let i = 0; i < 24; i++) {
       if (!rows[i] || !rows[i][0]) {
@@ -228,17 +233,12 @@ async function upsertSchedule(spreadsheetId, sheetName, text, chatId, telegram) 
   });
 }
 
-// Обновление расписания по ФИО (для админа)
 async function upsertScheduleForFio(spreadsheetId, sheetName, text, fio, telegram, chatIdForErrors) {
   if (!fio || !fio.trim()) {
     await telegram.sendMessage(chatIdForErrors, "Не указано ФИО для изменения графика.");
     return;
   }
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId,
-    range: `'${sheetName}'!B4:B27`,
-  });
-  const rows = res.data.values || [];
+  const rows = await loadDataRows(spreadsheetId, sheetName);
 
   let rowIdx = null;
   let names = [];
@@ -249,11 +249,8 @@ async function upsertScheduleForFio(spreadsheetId, sheetName, text, fio, telegra
 
   let pp = null;
   if (rowIdx !== null) {
-    const ppRes = await sheets.spreadsheets.values.get({
-      spreadsheetId,
-      range: `'${sheetName}'!A${rowIdx}:A${rowIdx}`,
-    });
-    pp = (ppRes.data.values && ppRes.data.values[0] && ppRes.data.values[0][0]) || names.length;
+    const rowVals = rows[rowIdx - 4] || [];
+    pp = rowVals[0] || names.length;
   } else {
     for (let i = 0; i < 24; i++) {
       if (!rows[i] || !rows[i][0]) {
@@ -277,16 +274,13 @@ async function upsertScheduleForFio(spreadsheetId, sheetName, text, fio, telegra
     resource: { values: [row] },
   });
 }
-
-// ====================== НОВОЕ =======================
-// Получить график для юзера (строкой, для editMessageText)
 async function getScheduleText(spreadsheetId, userId, nextWeek = false) {
   const { from, to } = getWeekBounds(nextWeek);
   const sheetName = `${from.format("DD.MM")}-${to.format("DD.MM")}`;
   const res = await sheets.spreadsheets.values.get({ spreadsheetId, range: `'${sheetName}'!A4:I27` });
   const rows = res.data.values || [];
   let text = `📋 График на период *${from.format("DD.MM")}–${to.format("DD.MM")}*:\n\n`;
-  const user = await getUserByIdDb(String(userId));
+  const user = await getUserById(String(userId));
   const fio = user?.name;
   if (!fio) {
     return "❌ Вы не зарегистрированы как курьер. Пройдите регистрацию /start";
@@ -302,7 +296,6 @@ async function getScheduleText(spreadsheetId, userId, nextWeek = false) {
   return text;
 }
 
-// Получить график для админа (все курьеры на выбранную неделю)
 async function getAdminScheduleText(spreadsheetId, nextWeek = false) {
   const { from, to } = getWeekBounds(nextWeek);
   const sheetName = `${from.format("DD.MM")}-${to.format("DD.MM")}`;
@@ -312,7 +305,10 @@ async function getAdminScheduleText(spreadsheetId, nextWeek = false) {
   if (!rows.length) return "Ещё нет записей в графике.";
   for (const r of rows) {
     if (!r[1]) continue;
-    const times = r.slice(2, 9).map((t, i) => `${DAY_MAP_SHORT[i]}: ${t}`).join("\n");
+    const times = r
+      .slice(2, 9)
+      .map((t, i) => `${DAY_MAP_SHORT[i]}: ${t}`)
+      .join("\n");
     text += `*${r[1]}*\n${times}\n\n`;
   }
   return text;
@@ -323,6 +319,7 @@ module.exports = {
   parseAndAppend,
   upsertSchedule,
   upsertScheduleForFio,
+  parseSchedule,
   getScheduleText,
   getAdminScheduleText,
   isScheduleSubmissionAllowed,

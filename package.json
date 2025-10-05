@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "axios": "^1.12.2",
     "dotenv": "^16.5.0",
     "googleapis": "^148.0.0",
     "moment": "^2.30.1",
@@ -10,15 +11,23 @@
     "winston": "^3.17.0"
   },
   "name": "courier",
-  "version": "1.0.0",
+  "version": "2.0.3",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "migrate": "node migrate.js",
     "migrate:users": "node migrate-users.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"No tests configured\" && exit 0",
+    "test:content": "node test-content.js"
   },
-  "keywords": [],
+  "keywords": [
+    "telegram",
+    "bot",
+    "courier",
+    "schedule",
+    "google-sheets"
+  ],
   "author": "",
   "license": "ISC",
-  "description": ""
+  "description": "Telegram bot for courier schedule management with Google Sheets integration, links and training materials"
 }

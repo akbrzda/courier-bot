@@ -1,5 +1,4 @@
 node_modules
-.env
 creds.json
 users.json
 npm-debug.log
