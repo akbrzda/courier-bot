@@ -1,4 +1,5 @@
 const moment = require("moment-timezone");
+const { TIMEZONE } = require("../config");
 
 const DEFAULT_ALLOWED = ["Табель", "График", "Авторизация"];
 const allowedHashtags = process.env.LOG_ALLOWED_HASHTAGS
@@ -43,7 +44,7 @@ async function sendLogToGroup(bot, logMessage, hashtag = "Логи") {
 }
 
 async function logAction(bot, action, userId, userInfo = {}, additionalData = {}, hashtag = "Логи") {
-  const timestamp = moment().tz("Asia/Yekaterinburg").format("DD.MM.YYYY | HH:mm");
+  const timestamp = moment().tz(TIMEZONE).format("DD.MM.YYYY | HH:mm");
   const groupMessage = `🕐 <b>${timestamp}</b>\n👤 <b>Пользователь:</b> ${userInfo.name || "Неизвестно"} (ID: ${
     userInfo.username || userId
   })\n📝 <b>Действие:</b> ${action}${Object.keys(additionalData).length ? `\n📊 <b>Данные:</b> ${JSON.stringify(additionalData, null, 2)}` : ""}`;
@@ -64,7 +65,7 @@ async function logAuthAction(bot, userId, userInfo, action, additionalData = {})
 
 async function logError(bot, error, userId, userInfo = {}, context = "") {
   // По умолчанию не шлём подробные ошибки в группу. Логи ошибок пишем в консоль.
-  const timestamp = moment().tz("Asia/Yekaterinburg").format("DD.MM.YYYY | HH:mm");
+  const timestamp = moment().tz(TIMEZONE).format("DD.MM.YYYY | HH:mm");
   const safeUser = userInfo && userInfo.name ? userInfo.name : "Неизвестно";
   const safeId = (userInfo && userInfo.username) || userId;
   const errMessage = String(error && error.message) || String(error);

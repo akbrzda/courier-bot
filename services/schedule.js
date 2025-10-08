@@ -1,6 +1,7 @@
 const { google } = require("googleapis");
 const moment = require("moment-timezone");
-const { getUserById, listApprovedUsers } = require("./services.users");
+const { TIMEZONE, TEMPLATE_SHEET_NAME } = require("../config");
+const { getUserById, listApprovedUsers } = require("./users");
 
 const auth = new google.auth.GoogleAuth({
   keyFile: "creds.json",
@@ -9,10 +10,8 @@ const auth = new google.auth.GoogleAuth({
 const sheets = google.sheets({ version: "v4", auth });
 
 const DAY_MAP_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
-const TEMPLATE_SHEET_NAME = process.env.TEMPLATE_SHEET_NAME || "Template";
-
 function isScheduleSubmissionAllowed() {
-  const now = moment().tz("Asia/Yekaterinburg");
+  const now = moment().tz(TIMEZONE);
   const day = now.isoWeekday();
   const time = now.format("HH:mm");
   if ((day === 4 && time >= "22:00") || day === 5 || day === 6 || (day === 7 && time < "12:00")) {
@@ -22,7 +21,7 @@ function isScheduleSubmissionAllowed() {
 }
 
 function getWeekBounds(nextWeek = false) {
-  const now = moment().tz("Asia/Yekaterinburg");
+  const now = moment().tz(TIMEZONE);
   const mon = now
     .clone()
     .startOf("isoWeek")
@@ -320,19 +319,23 @@ async function getBranchScheduleText(spreadsheetId, branchId, branchLabel = "Ф�
   const res = await sheets.spreadsheets.values.get({ spreadsheetId, range: `'${sheetName}'!A4:I27` });
   const rows = res.data.values || [];
 
-  const approvedUsers = await listApprovedUsers();
-  const branchNames = new Set(
-    approvedUsers
-      .filter((u) => u.branch === branchId)
-      .map((u) => u.name)
-      .filter(Boolean)
-  );
+  let filteredRows = rows;
+  if (branchId) {
+    const approvedUsers = await listApprovedUsers();
+    const branchNames = new Set(
+      approvedUsers
+        .filter((u) => u.branch === branchId)
+        .map((u) => u.name)
+        .filter(Boolean)
+    );
 
-  if (!branchNames.size) {
-    return `Для филиала ${branchLabel} пока нет курьеров с заполненным графиком.`;
+    if (!branchNames.size) {
+      return `Для филиала ${branchLabel} пока нет курьеров с заполненным графиком.`;
+    }
+
+    filteredRows = rows.filter((row) => row && row[1] && branchNames.has(row[1]));
   }
 
-  const filteredRows = rows.filter((row) => row && row[1] && branchNames.has(row[1]));
   if (!filteredRows.length) {
     return `В графике на период *${from.format("DD.MM")}–${to.format("DD.MM")}* нет записей по филиалу ${branchLabel}.`;
   }

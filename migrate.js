@@ -4,7 +4,7 @@
  */
 
 require("dotenv").config();
-const { pool, initSchema } = require("./db");
+const { pool, initSchema } = require("./services/db");
 
 async function migrate() {
   console.log("🔄 Начало миграции...");
