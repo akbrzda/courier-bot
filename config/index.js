@@ -1,5 +1,7 @@
 const TIMEZONE = "Asia/Yekaterinburg";
 
+const REQUIRED_ENV_VARS = Object.freeze(["BOT_TOKEN", "DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME", "GRAFIK", "SHEET_ID"]);
+
 const BRANCHES = [
   { id: "surgut_1", label: "Сургут 1 (30 Лет Победы)" },
   { id: "surgut_2", label: "Сургут 2 (Усольцева)" },
@@ -34,6 +36,13 @@ const SPREADSHEET_ID = process.env.GRAFIK;
 const TEMPLATE_SHEET_NAME = process.env.TEMPLATE_SHEET_NAME || "Template";
 const REPORT_SHEET_ID = process.env.SHEET_ID;
 
+function validateConfig() {
+  const missing = REQUIRED_ENV_VARS.filter((key) => !process.env[key] || String(process.env[key]).trim() === "");
+  if (missing.length) {
+    throw new Error(`Отсутствуют обязательные переменные окружения: ${missing.join(", ")}`);
+  }
+}
+
 module.exports = {
   TIMEZONE,
   BRANCHES,
@@ -45,4 +54,5 @@ module.exports = {
   SPREADSHEET_ID,
   TEMPLATE_SHEET_NAME,
   REPORT_SHEET_ID,
+  validateConfig,
 };

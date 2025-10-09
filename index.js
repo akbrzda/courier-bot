@@ -1,16 +1,17 @@
 require("dotenv").config();
+const { validateConfig } = require("./config");
 const { createBot } = require("./bot");
 const { initSchema } = require("./services/db");
 const { registerJobs, notifyUsersWithoutBranch } = require("./jobs");
+const { logError, logSystemError } = require("./services/logger");
 
 async function bootstrap() {
-  if (!process.env.BOT_TOKEN) {
-    throw new Error("Отсутствует BOT_TOKEN в переменных окружения");
-  }
+  validateConfig();
+  const botToken = process.env.BOT_TOKEN;
 
   await initSchema();
 
-  const bot = createBot(process.env.BOT_TOKEN);
+  const bot = createBot(botToken);
 
   const jobs = registerJobs(bot);
 
@@ -20,7 +21,7 @@ async function bootstrap() {
   try {
     await jobs.notifyUsersWithoutBranch();
   } catch (err) {
-    console.error("Не удалось запустить напоминание о выборе филиала:", err.message);
+    await logError(bot, err, "system", { name: "Система" }, "Не удалось запустить напоминание о выборе филиала");
   }
 
   process.once("SIGINT", () => bot.stop("SIGINT"));
@@ -30,6 +31,6 @@ async function bootstrap() {
 }
 
 bootstrap().catch((err) => {
-  console.error("❌ Не удалось запустить бота:", err);
+  logSystemError(err, "Не удалось запустить бота");
   process.exit(1);
 });

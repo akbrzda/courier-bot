@@ -65,20 +65,39 @@ async function logAuthAction(bot, userId, userInfo, action, additionalData = {})
 
 async function logError(bot, error, userId, userInfo = {}, context = "") {
   // По умолчанию не шлём подробные ошибки в группу. Логи ошибок пишем в консоль.
-  const timestamp = moment().tz(TIMEZONE).format("DD.MM.YYYY | HH:mm");
+  const meta = prepareErrorMeta(error, context);
   const safeUser = userInfo && userInfo.name ? userInfo.name : "Неизвестно";
   const safeId = (userInfo && userInfo.username) || userId;
-  const errMessage = String(error && error.message) || String(error);
-  const contextShort = String(context).length > 200 ? String(context).slice(0, 200) + "..." : context;
 
-  console.error(`[${timestamp}] ERROR for ${safeUser} (ID: ${safeId}) - ${contextShort} - ${errMessage}`);
-  if (error && error.stack) console.error(error.stack);
+  emitConsoleError(`ERROR for ${safeUser}`, safeId, meta, error);
 
   // Если явно разрешено через env, отправим краткое уведомление в группу (без стека)
   if (String(process.env.SEND_ERRORS_TO_GROUP || "false").toLowerCase() === "true") {
+    const { timestamp, contextShort, errMessage } = meta;
     const groupMessage = `❌ <b>ОШИБКА</b>\n🕐 <b>${timestamp}</b>\n👤 <b>Пользователь:</b> ${safeUser} (ID: ${safeId})\n📝 <b>Контекст:</b> ${contextShort}\n💥 <b>Ошибка:</b> ${errMessage}`;
     sendError(bot, groupMessage);
   }
+}
+
+function prepareErrorMeta(error, context = "") {
+  const timestamp = moment().tz(TIMEZONE).format("DD.MM.YYYY | HH:mm");
+  const errMessage = String(error && error.message) || String(error);
+  const contextStr = String(context || "");
+  const contextShort = contextStr.length > 200 ? `${contextStr.slice(0, 200)}...` : contextStr;
+  return { timestamp, errMessage, contextShort };
+}
+
+function emitConsoleError(label, identifier, meta, error) {
+  const { timestamp, contextShort, errMessage } = meta;
+  const safeLabel = label || "SYSTEM ERROR";
+  const safeIdentifier = identifier || "unknown";
+  console.error(`[${timestamp}] ${safeLabel} (ID: ${safeIdentifier}) - ${contextShort} - ${errMessage}`);
+  if (error && error.stack) console.error(error.stack);
+}
+
+function logSystemError(error, context = "") {
+  const meta = prepareErrorMeta(error, context);
+  emitConsoleError("SYSTEM ERROR", "system", meta, error);
 }
 
 async function logBotStart(bot, userId, userInfo, isAdmin = false) {
@@ -105,4 +124,7 @@ module.exports = {
   sendLogToGroup,
   sendLog,
   sendError,
+  logSystemError,
+  prepareErrorMeta,
+  emitConsoleError,
 };

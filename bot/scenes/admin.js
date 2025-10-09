@@ -15,6 +15,7 @@ const {
   getUserById,
   deleteUser,
   listApprovedUsers,
+  listAllUsers,
   updateUserName,
   updateUserRole,
 } = require("../../services/users");
