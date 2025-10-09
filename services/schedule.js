@@ -1,7 +1,7 @@
 const { google } = require("googleapis");
 const moment = require("moment-timezone");
 const { TIMEZONE, TEMPLATE_SHEET_NAME } = require("../config");
-const { getUserById, listApprovedUsers } = require("./users");
+const { getUserById } = require("./users");
 
 const auth = new google.auth.GoogleAuth({
   keyFile: "creds.json",
@@ -10,6 +10,13 @@ const auth = new google.auth.GoogleAuth({
 const sheets = google.sheets({ version: "v4", auth });
 
 const DAY_MAP_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
+const DAY_FULL_NAMES = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"];
+const OFF_VALUE_REGEX = /(вых|выход)/i;
+const MARKDOWN_ESCAPE_REGEX = /([_*\[\]()~`>#+=|{}.!])/g;
+
+function escapeMarkdown(value = "") {
+  return String(value).replace(MARKDOWN_ESCAPE_REGEX, "\\$1");
+}
 function isScheduleSubmissionAllowed() {
   const now = moment().tz(TIMEZONE);
   const day = now.isoWeekday();
@@ -300,17 +307,12 @@ async function getAdminScheduleText(spreadsheetId, nextWeek = false) {
   const sheetName = `${from.format("DD.MM")}-${to.format("DD.MM")}`;
   const res = await sheets.spreadsheets.values.get({ spreadsheetId, range: `'${sheetName}'!A4:I27` });
   const rows = res.data.values || [];
-  let text = `📋 График всех курьеров на период *${from.format("DD.MM")}–${to.format("DD.MM")}*:\n\n`;
-  if (!rows.length) return "Ещё нет записей в графике.";
-  for (const r of rows) {
-    if (!r[1]) continue;
-    const times = r
-      .slice(2, 9)
-      .map((t, i) => `${DAY_MAP_SHORT[i]}: ${t}`)
-      .join("\n");
-    text += `*${r[1]}*\n${times}\n\n`;
+  const dayBuckets = buildDayBuckets(rows);
+  if (!dayBuckets.hasData) {
+    return "Ещё нет записей в графике.";
   }
-  return text;
+  const header = `📋 График всех курьеров на период *${from.format("DD.MM")}–${to.format("DD.MM")}*:\n`;
+  return `${header}\n${formatBucketsByDay(dayBuckets.buckets)}`;
 }
 
 async function getBranchScheduleText(spreadsheetId, branchId, branchLabel = "Филиал", nextWeek = false) {
@@ -319,36 +321,109 @@ async function getBranchScheduleText(spreadsheetId, branchId, branchLabel = "Ф�
   const res = await sheets.spreadsheets.values.get({ spreadsheetId, range: `'${sheetName}'!A4:I27` });
   const rows = res.data.values || [];
 
-  let filteredRows = rows;
-  if (branchId) {
-    const approvedUsers = await listApprovedUsers();
-    const branchNames = new Set(
-      approvedUsers
-        .filter((u) => u.branch === branchId)
-        .map((u) => u.name)
-        .filter(Boolean)
-    );
+  const filteredRows = rows;
 
-    if (!branchNames.size) {
-      return `Для филиала ${branchLabel} пока нет курьеров с заполненным графиком.`;
+  const dayBuckets = buildDayBuckets(filteredRows);
+  if (!dayBuckets.hasData) {
+    return `В графике на период *${from.format("DD.MM")}–${to.format("DD.MM")}* нет записей.`;
+  }
+
+  const header = `📋 График филиала ${escapeMarkdown(branchLabel)} на период *${from.format("DD.MM")}–${to.format("DD.MM")}*:\n`;
+  return `${header}\n${formatBucketsByDay(dayBuckets.buckets)}`;
+}
+
+function buildDayBuckets(rows) {
+  const buckets = DAY_MAP_SHORT.map(() => ({
+    working: [],
+    off: [],
+    unknown: [],
+  }));
+
+  for (const row of rows) {
+    if (!row || !row[1]) continue;
+    const name = String(row[1]).trim();
+    if (!name) continue;
+
+    for (let dayIdx = 0; dayIdx < 7; dayIdx += 1) {
+      const cellRaw = row[2 + dayIdx];
+      const cell = cellRaw === undefined || cellRaw === null ? "" : String(cellRaw).trim();
+      const bucket = buckets[dayIdx];
+
+      if (!cell) {
+        bucket.unknown.push(name);
+        continue;
+      }
+
+      if (OFF_VALUE_REGEX.test(cell)) {
+        bucket.off.push(name);
+        continue;
+      }
+
+      bucket.working.push({ name, shift: cell });
+    }
+  }
+
+  const hasData = buckets.some((bucket) => bucket.working.length || bucket.off.length || bucket.unknown.length);
+
+  return { buckets, hasData };
+}
+
+function parseShiftStartMinutes(shift) {
+  if (!shift) return Number.MAX_SAFE_INTEGER;
+  const match = String(shift).match(/(\d{1,2})[:.]?(\d{2})?/);
+  if (!match) return Number.MAX_SAFE_INTEGER;
+  const hours = parseInt(match[1], 10);
+  const minutes = match[2] ? parseInt(match[2], 10) : 0;
+  if (Number.isNaN(hours) || hours < 0) return Number.MAX_SAFE_INTEGER;
+  const clampedMinutes = Number.isNaN(minutes) || minutes < 0 ? 0 : Math.min(minutes, 59);
+  return hours * 60 + clampedMinutes;
+}
+
+function formatBucketsByDay(buckets) {
+  const sections = [];
+
+  buckets.forEach((bucket, idx) => {
+    bucket.working.sort((a, b) => {
+      const diff = parseShiftStartMinutes(a.shift) - parseShiftStartMinutes(b.shift);
+      if (diff !== 0) return diff;
+      return a.name.localeCompare(b.name, "ru");
+    });
+
+    bucket.off.sort((a, b) => a.localeCompare(b, "ru"));
+    bucket.unknown.sort((a, b) => a.localeCompare(b, "ru"));
+
+    const lines = [];
+    lines.push(`*${DAY_MAP_SHORT[idx]} (${DAY_FULL_NAMES[idx]})*`);
+
+    lines.push(`Работают (${bucket.working.length}):`);
+    if (bucket.working.length) {
+      bucket.working.forEach(({ name, shift }, idx) => {
+        lines.push(`${idx + 1}. ${escapeMarkdown(name)} — ${escapeMarkdown(shift)}`);
+      });
+    } else {
+      lines.push("0. —");
     }
 
-    filteredRows = rows.filter((row) => row && row[1] && branchNames.has(row[1]));
-  }
+    lines.push(`\nВыходной (${bucket.off.length}):`);
+    if (bucket.off.length) {
+      bucket.off.forEach((name, idx) => {
+        lines.push(`${idx + 1}. ${escapeMarkdown(name)}`);
+      });
+    } else {
+      lines.push("0. —");
+    }
 
-  if (!filteredRows.length) {
-    return `В графике на период *${from.format("DD.MM")}–${to.format("DD.MM")}* нет записей по филиалу ${branchLabel}.`;
-  }
+    if (bucket.unknown.length) {
+      lines.push(`Не указан (${bucket.unknown.length}):`);
+      bucket.unknown.forEach((name, idx) => {
+        lines.push(`${idx + 1}. ${escapeMarkdown(name)}`);
+      });
+    }
 
-  let text = `📋 График филиала ${branchLabel} на период *${from.format("DD.MM")}–${to.format("DD.MM")}*:\n\n`;
-  for (const r of filteredRows) {
-    const times = r
-      .slice(2, 9)
-      .map((t, i) => `${DAY_MAP_SHORT[i]}: ${t}`)
-      .join("\n");
-    text += `*${r[1]}*\n${times}\n\n`;
-  }
-  return text;
+    sections.push(lines.join("\n"));
+  });
+
+  return sections.join("\n\n\n");
 }
 
 module.exports = {

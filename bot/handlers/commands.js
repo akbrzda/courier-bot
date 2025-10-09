@@ -186,6 +186,8 @@ function registerCommandHandlers(bot) {
     await logAction(bot, "Открытие управления ссылками", userId, adminInfo, {}, "Логи");
 
     const links = await getAllLinks();
+    ctx.session = ctx.session || {};
+    ctx.session.linksAdminPage = 0;
     if (!links.length) {
       return await ctx.reply("📋 Список ссылок пуст", Markup.inlineKeyboard([[Markup.button.callback("➕ Добавить", "admin:addLink")]]));
     }
@@ -214,11 +216,20 @@ function registerCommandHandlers(bot) {
     await logAction(bot, "Открытие управления обучением", userId, adminInfo, {}, "Логи");
 
     const materials = await getAllTrainingMaterials();
+    ctx.session = ctx.session || {};
+    ctx.session.trainingPage = 0;
+    ctx.session.trainingViewMode = "admin";
     if (!materials.length) {
-      return await ctx.reply("📋 Список материалов пуст", Markup.inlineKeyboard([[Markup.button.callback("➕ Добавить", "admin:addTraining")]]));
+      return await ctx.reply(
+        "📋 Список материалов пуст",
+        Markup.inlineKeyboard([
+          [Markup.button.callback("➕ Добавить", "training:add")],
+          [Markup.button.callback("◀️ Назад", "menu:main")],
+        ])
+      );
     }
 
-    const keyboard = createPaginatedKeyboard(materials, 0, 6, "training", true);
+    const keyboard = createPaginatedKeyboard(materials, 0, 5, "training", true);
     await ctx.reply("📚 Обучение:", keyboard);
   });
 

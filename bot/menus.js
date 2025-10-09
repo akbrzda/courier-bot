@@ -14,18 +14,15 @@ function getMainMenuInline(user = null) {
   buttons.push([Markup.button.callback("📊 График", "menu:schedule")]);
   buttons.push([Markup.button.callback("🔗 Полезные ссылки", "menu:links")]);
   buttons.push([Markup.button.callback("📚 Обучение", "menu:training")]);
-  buttons.push([Markup.button.callback("✉️ Написать администратору", "support:start")]);
+  buttons.push([Markup.button.callback("⚙️ Настройки", "menu:settings")]);
   return Markup.inlineKeyboard(buttons);
 }
 
 function getReportMenuInline() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback("📅 За сегодня", "report:today")],
-    [Markup.button.callback("📆 За вчера", "report:yesterday")],
-    [Markup.button.callback("📊 Текущая неделя", "report:week_current")],
-    [Markup.button.callback("📊 Прошлая неделя", "report:week_prev")],
-    [Markup.button.callback("🗓 Этот месяц", "report:month_current")],
-    [Markup.button.callback("🗓 Прошлый месяц", "report:month_prev")],
+    [Markup.button.callback("📅 За сегодня", "report:today"), Markup.button.callback("📆 За вчера", "report:yesterday")],
+    [Markup.button.callback("📊 Текущая неделя", "report:week_current"), Markup.button.callback("📊 Прошлая неделя", "report:week_prev")],
+    [Markup.button.callback("🗓 Этот месяц", "report:month_current"), Markup.button.callback("🗓 Прошлый месяц", "report:month_prev")],
     [Markup.button.callback("📅 Выбрать период…", "report:custom")],
     [Markup.button.callback("◀️ Назад", "menu:main")],
   ]);
